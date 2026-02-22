@@ -383,6 +383,46 @@ unsafe extern "C" fn js_unhook(
     JSValue::bool(true).raw()
 }
 
+/// callNative(ptr) - Call a native function at the given address with no arguments.
+/// Returns the i64 return value (X0 register) as a BigInt.
+/// Useful for triggering hooked functions from JS to verify hook callbacks.
+unsafe extern "C" fn js_call_native(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"callNative() requires 1 argument\0".as_ptr() as *const _,
+        );
+    }
+
+    let ptr_arg = JSValue(*argv);
+
+    let addr = match get_native_pointer_addr(ctx, ptr_arg) {
+        Some(a) => a,
+        None => match ptr_arg.to_u64(ctx) {
+            Some(a) => a,
+            None => {
+                return ffi::JS_ThrowTypeError(
+                    ctx,
+                    b"callNative() argument must be a pointer or number\0".as_ptr() as *const _,
+                )
+            }
+        },
+    };
+
+    if addr == 0 {
+        return ffi::JS_ThrowRangeError(ctx, b"callNative() null address\0".as_ptr() as *const _);
+    }
+
+    let func: unsafe extern "C" fn() -> i64 = std::mem::transmute(addr as usize);
+    let result = func();
+    ffi::JS_NewBigUint64(ctx, result as u64)
+}
+
 /// Register hook API
 pub fn register_hook_api(ctx: &JSContext) {
     let global = ctx.global_object();
@@ -397,6 +437,12 @@ pub fn register_hook_api(ctx: &JSContext) {
         let cname = CString::new("unhook").unwrap();
         let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_unhook), cname.as_ptr(), 1);
         global.set_property(ctx.as_ptr(), "unhook", JSValue(func_val));
+
+        // Register callNative(ptr) - call native function with no args, returns BigInt
+        let cname = CString::new("callNative").unwrap();
+        let func_val =
+            ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_call_native), cname.as_ptr(), 1);
+        global.set_property(ctx.as_ptr(), "callNative", JSValue(func_val));
     }
 
     global.free(ctx.as_ptr());
