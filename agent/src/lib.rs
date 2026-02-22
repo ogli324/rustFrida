@@ -216,7 +216,14 @@ impl Drop for ExecMem {
 }
 
 fn connect_socket() -> Result<UnixStream> {
-    let name = b"rust_frida_socket";
+    // 优先使用 hello_entry() 从 StringTable 读取的动态 socket 名（rust_frida_{pid}），
+    // 回退到旧的硬编码值（仅用于兼容老版本 host）
+    let name_str = SOCKET_NAME
+        .get()
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_else(|| b"rust_frida_socket".to_vec());
+    let name = name_str.as_slice();
+
     let fd = unsafe { libc::socket(AF_UNIX, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(format!("创建 socket 失败: {}", Error::last_os_error()));
@@ -250,6 +257,8 @@ fn connect_socket() -> Result<UnixStream> {
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 
 static GLOBAL_STREAM: OnceLock<UnixStream> = OnceLock::new();
+/// 动态 socket 名，由 hello_entry() 从 StringTable 读取后保存
+static SOCKET_NAME: OnceLock<String> = OnceLock::new();
 static CACHE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 
@@ -644,6 +653,13 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
         // 解析 StringTable 结构
         let string_table = string_table as *const StringTable;
         let table = &*string_table;
+
+        // 读取动态 socket 名（rust_frida_{pid}）并保存，connect_socket() 将使用它
+        if let Some(sock) = table.get_socket_name() {
+            if sock != "novalue" {
+                let _ = SOCKET_NAME.set(sock);
+            }
+        }
 
         // 读取 output_path 并保存到全局变量
         if let Some(output) = table.get_output_path() {
