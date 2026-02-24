@@ -865,7 +865,7 @@ fn process_cmd(command: &str) {
         _ => {
             let cmd_name = command.split_whitespace().next().unwrap_or("(empty)");
             log_msg(format!(
-                "无效命令 '{}'，输入 help 查看可用命令列表\n",
+                "无效命令 '{}'，在 REPL 中输入 help 查看可用命令\n",
                 cmd_name
             ));
         }

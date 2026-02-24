@@ -27,22 +27,18 @@ macro_rules! define_libc_functions {
         }
 
         impl LibcOffsets {
-            pub(crate) fn calculate(self_base: usize, target_base: usize) -> Self {
-                Self {
-                    $(
-                        $name: {
-                            let sym_addr = $name as *const () as usize;
-                            if sym_addr < self_base {
-                                panic!(
-                                    "符号 {} 地址(0x{:x}) 小于libc基址(0x{:x})",
-                                    stringify!($name), sym_addr, self_base
-                                );
-                            }
-                            let offset = sym_addr - self_base;
-                            target_base + offset
-                        }
-                    ),*
-                }
+            pub(crate) fn calculate(self_base: usize, target_base: usize) -> Result<Self, String> {
+                $(
+                    let sym_addr = $name as *const () as usize;
+                    if sym_addr < self_base {
+                        return Err(format!(
+                            "符号 {} 地址(0x{:x}) 小于 libc 基址(0x{:x})，请确认 libc 版本匹配",
+                            stringify!($name), sym_addr, self_base
+                        ));
+                    }
+                    let $name = target_base + (sym_addr - self_base);
+                )*
+                Ok(Self { $($name),* })
             }
 
             pub(crate) fn print_offsets(&self) {
@@ -61,22 +57,18 @@ macro_rules! define_dl_functions {
         }
 
         impl DlOffsets {
-            pub(crate) fn calculate(self_base: usize, target_base: usize) -> Self {
-                Self {
-                    $(
-                        $name: {
-                            let sym_addr = $name as *const () as usize;
-                            if sym_addr < self_base {
-                                panic!(
-                                    "符号 {} 地址(0x{:x}) 小于dl基址(0x{:x})",
-                                    stringify!($name), sym_addr, self_base
-                                );
-                            }
-                            let offset = sym_addr - self_base;
-                            target_base + offset
-                        }
-                    ),*
-                }
+            pub(crate) fn calculate(self_base: usize, target_base: usize) -> Result<Self, String> {
+                $(
+                    let sym_addr = $name as *const () as usize;
+                    if sym_addr < self_base {
+                        return Err(format!(
+                            "符号 {} 地址(0x{:x}) 小于 libdl 基址(0x{:x})，请确认 libdl 版本匹配",
+                            stringify!($name), sym_addr, self_base
+                        ));
+                    }
+                    let $name = target_base + (sym_addr - self_base);
+                )*
+                Ok(Self { $($name),* })
             }
 
             pub(crate) fn print_offsets(&self) {

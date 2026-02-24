@@ -75,8 +75,8 @@ pub(crate) fn inject_to_process(
     log_verbose!("目标进程 libdl.so 基址: 0x{:x}", target_dl_base);
 
     // 计算目标进程中的函数地址
-    let offsets = LibcOffsets::calculate(self_base, target_base);
-    let dl_offsets = DlOffsets::calculate(self_dl_base, target_dl_base);
+    let offsets = LibcOffsets::calculate(self_base, target_base)?;
+    let dl_offsets = DlOffsets::calculate(self_dl_base, target_dl_base)?;
 
     // 打印所有函数地址（仅 verbose 模式）
     if crate::logger::is_verbose() {

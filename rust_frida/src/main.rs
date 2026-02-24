@@ -200,9 +200,18 @@ fn main() {
                     "等待 agent 连接超时 ({}s)，请检查:",
                     args.connect_timeout
                 );
+                // 检查目标进程是否仍在运行
+                if let Some(pid) = target_pid {
+                    if std::path::Path::new(&format!("/proc/{}/status", pid)).exists() {
+                        log_warn!("  目标进程 {} 仍在运行（agent 可能崩溃或未加载）", pid);
+                    } else {
+                        log_warn!("  目标进程 {} 已退出（可能被 OOM 或信号终止）", pid);
+                    }
+                }
                 log_warn!("  1. dmesg | grep -i 'deny\\|avc'  （SELinux 拦截？）");
                 log_warn!("  2. logcat | grep -E 'FATAL|crash'  （agent 崩溃？）");
-                log_warn!("  3. 使用 --verbose 重新运行查看详细日志");
+                log_warn!("  3. 使用 --verbose 重新运行查看详细注入日志");
+                log_warn!("  4. adb logcat | grep rustFrida  （查看 agent 日志）");
                 std::process::exit(1);
             }
             std::thread::sleep(std::time::Duration::from_millis(500));

@@ -15,7 +15,18 @@ fn parse_pid(s: &str) -> std::result::Result<i32, String> {
     author,
     version,
     about = "ARM64 Android 动态插桩工具，通过 ptrace 注入 agent.so，支持 QuickJS 脚本/inline hook/Frida Stalker",
-    long_about = None,
+    long_about = "\
+ARM64 Android 动态插桩工具。通过 ptrace 注入 agent.so 到目标进程，支持 QuickJS 脚本执行、\
+inline hook、Frida Stalker 追踪等功能。
+
+常见用法:
+  rustfrida --pid 1234                         # 注入到指定 PID
+  rustfrida --name com.example.app             # 按进程名注入
+  rustfrida --watch-so libnative.so            # 等待 SO 加载后自动注入
+  rustfrida --pid 1234 -l script.js            # 注入并执行 JS 脚本
+  rustfrida --pid 1234 --verbose               # 显示详细注入调试信息
+
+注入后进入 REPL，输入 help 查看可用命令（jsinit / loadjs / jsrepl / jhook 等）。",
     group(ArgGroup::new("target").required(true).args(["pid", "watch_so", "name"]))
 )]
 pub(crate) struct Args {
@@ -29,7 +40,7 @@ pub(crate) struct Args {
     )]
     pub(crate) pid: Option<i32>,
 
-    /// 监听指定 SO 路径加载，自动附加到加载该 SO 的进程
+    /// 监听指定 SO 路径加载，自动附加到加载该 SO 的进程（需要 ldmonitor eBPF 组件：cargo build -p ldmonitor）
     #[arg(short = 'w', long = "watch-so", conflicts_with = "name")]
     pub(crate) watch_so: Option<String>,
 

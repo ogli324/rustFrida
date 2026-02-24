@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use crate::communication::{complete_state, eval_state};
 use crate::log_error;
-use crate::logger::{GREEN, RED, YELLOW};
+use crate::logger::{GRAY, GREEN, HIGHLIGHT_BG, HIGHLIGHT_FG, RED, RESET, YELLOW};
 
 /// 当前构建实际可用的命令列表（编译时由 feature 控制）
 pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)] {
@@ -36,8 +36,8 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
         }
         #[cfg(not(feature = "frida-gum"))]
         {
-            v.push(("stalker", "[tid]", "Frida Stalker 追踪 [需要 frida-gum]"));
-            v.push(("hfl", "<module> <offset>", "Interceptor hook 指定偏移 [需要 frida-gum]"));
+            v.push(("stalker", "[tid]", "Frida Stalker 追踪 [--features frida-gum 启用]"));
+            v.push(("hfl", "<module> <offset>", "Interceptor hook 指定偏移 [--features frida-gum 启用]"));
         }
         #[cfg(feature = "qbdi")]
         {
@@ -45,7 +45,7 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
         }
         #[cfg(not(feature = "qbdi"))]
         {
-            v.push(("qfl", "<module> <offset>", "QBDI 追踪指定偏移 [需要 qbdi]"));
+            v.push(("qfl", "<module> <offset>", "QBDI 追踪指定偏移 [--features qbdi 启用]"));
         }
         v
     })
@@ -109,9 +109,9 @@ impl JsReplCompleter {
         }
     }
 
-    /// 向 agent 发送 jscomplete 请求，持锁等待响应（≤2000 ms），避免竞态。
+    /// 向 agent 发送 jscomplete 请求，持锁等待响应（≤300 ms），避免竞态。
     fn fetch_completions(&self, prefix: &str) -> Vec<String> {
-        let timeout = std::time::Duration::from_millis(2000);
+        let timeout = std::time::Duration::from_millis(300);
         let cmd = format!("jscomplete {}", prefix);
         let sender = self.sender.clone();
         // 持锁 clear + 发命令 + wait，原子消除竞态窗口
@@ -209,8 +209,7 @@ impl Hinter for JsReplCompleter {
 }
 impl Highlighter for JsReplCompleter {
     fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
-        // Gray text for hint
-        std::borrow::Cow::Owned(format!("\x1b[38;5;245m{}\x1b[0m", hint))
+        std::borrow::Cow::Owned(format!("{GRAY}{hint}{RESET}"))
     }
     fn highlight_candidate<'c>(
         &self,
@@ -218,7 +217,7 @@ impl Highlighter for JsReplCompleter {
         completion: CompletionType,
     ) -> std::borrow::Cow<'c, str> {
         if completion == CompletionType::List {
-            std::borrow::Cow::Owned(format!("\x1b[48;5;238m\x1b[38;5;255m{}\x1b[0m", candidate))
+            std::borrow::Cow::Owned(format!("{HIGHLIGHT_BG}{HIGHLIGHT_FG}{candidate}{RESET}"))
         } else {
             std::borrow::Cow::Borrowed(candidate)
         }
@@ -242,12 +241,22 @@ pub(crate) fn print_help() {
     println!();
     println!("{BOLD}{CYAN}JavaScript API（在 loadjs/jseval/jsrepl 中可用）:{RESET}");
     println!("{DIM}  console{RESET}      log/info/warn/error/debug");
-    println!("{DIM}  ptr(addr){RESET}    创建指针对象");
-    println!("{DIM}  Memory{RESET}       .readU8/16/32/64/Pointer/CString/Utf8String/ByteArray");
-    println!("{DIM}             {RESET}  .writeU8/16/32/64/Pointer");
+    println!("{DIM}  ptr(addr){RESET}    创建指针对象，addr 为数字或十六进制字符串");
+    println!("{DIM}  Memory{RESET}       .readU8/16/32/64(ptr)  → number");
+    println!("{DIM}             {RESET}  .readPointer(ptr)      → ptr");
+    println!("{DIM}             {RESET}  .readCString(ptr)      → string（最多 4096 字节）");
+    println!("{DIM}             {RESET}  .readByteArray(ptr, n) → ArrayBuffer");
+    println!("{DIM}             {RESET}  .writeU8/16/32/64(ptr, val)");
+    println!("{DIM}             {RESET}  .writePointer(ptr, val)");
+    println!("{DIM}             {RESET}  无效地址抛 RangeError，不会 crash");
     println!("{DIM}  hook{RESET}         hook(target_ptr, replacement_ptr[, retval])");
+    println!("{DIM}             {RESET}  replacement_ptr 为 JS 函数或 NativePointer");
     println!("{DIM}  unhook{RESET}       unhook(target_ptr)");
     println!("{DIM}  callNative{RESET}   callNative(addr, retType, argTypes, ...args)");
+    println!("{DIM}             {RESET}  retType/argType: 'void'|'int'|'long'|'ptr'|'float'");
+    println!("{DIM}  示例:{RESET}");
+    println!("{DIM}    jseval Memory.readCString(ptr(0x7f000000)){RESET}");
+    println!("{DIM}    loadjs hook(ptr(0x1234), function(ctx){{console.log('hit')}}){RESET}");
     println!();
 }
 

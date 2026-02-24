@@ -19,6 +19,11 @@ pub const BLUE: &str = "\x1b[34m";
 pub const MAGENTA: &str = "\x1b[35m";
 pub const CYAN: &str = "\x1b[36m";
 
+/// 256 色扩展常量（rustyline Highlighter 专用）
+pub const GRAY: &str = "\x1b[38;5;245m";
+pub const HIGHLIGHT_BG: &str = "\x1b[48;5;238m";
+pub const HIGHLIGHT_FG: &str = "\x1b[38;5;255m";
+
 /// [*] 蓝色前缀 - 通用信息
 #[macro_export]
 macro_rules! log_info {
@@ -109,9 +114,10 @@ macro_rules! log_agent {
 
 /// 打印 banner
 pub fn print_banner() {
+    let version = env!("CARGO_PKG_VERSION");
     println!(
         "\n {BOLD}{CYAN}╔══════════════════════════════════════╗{RESET}\n \
-         {BOLD}{CYAN}║{RESET}  {BOLD}      rustFrida v0.1.0             {RESET}{BOLD}{CYAN}║{RESET}\n \
+         {BOLD}{CYAN}║{RESET}  {BOLD}      rustFrida v{version:<17} {RESET}{BOLD}{CYAN}║{RESET}\n \
          {BOLD}{CYAN}║{RESET}  {DIM}  ARM64 Dynamic Instrumentation    {RESET}{BOLD}{CYAN}║{RESET}\n \
          {BOLD}{CYAN}╚══════════════════════════════════════╝{RESET}\n"
     );

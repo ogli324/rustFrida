@@ -196,6 +196,8 @@ pub(crate) fn handle_socket_connection(stream: UnixStream) {
             } else {
                 log_error!("memfd 无效，无法发送 agent.so");
             }
+            // loader 已接收 memfd，连接使命完成；后续 agent 会用新连接握手
+            break;
         } else if trimmed == "HELLO_AGENT" {
             log_success!("Agent 已连接");
             STOP_LISTENER.store(true, Ordering::SeqCst);
