@@ -189,6 +189,22 @@
                 if (typeof prop !== "string") return undefined;
                 if (!wrappers[prop]) wrappers[prop] = new MethodWrapper(cls, prop, null, cache);
                 return wrappers[prop];
+            },
+            ownKeys: function(_) {
+                if (cache._ownKeys) return cache._ownKeys;
+                var ms = _methods(cls);
+                var seen = {};
+                var keys = [];
+                for (var i = 0; i < ms.length; i++) {
+                    var n = ms[i].name === "<init>" ? "$init" : ms[i].name;
+                    if (!seen[n]) { seen[n] = true; keys.push(n); }
+                }
+                cache._ownKeys = keys;
+                return keys;
+            },
+            getOwnPropertyDescriptor: function(_, prop) {
+                if (typeof prop !== "string") return undefined;
+                return {enumerable: true, configurable: true};
             }
         });
     };
