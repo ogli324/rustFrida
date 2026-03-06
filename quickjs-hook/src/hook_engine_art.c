@@ -333,14 +333,12 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     }
     if (!entry->thunk) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
 
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -351,7 +349,6 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         entry->trampoline, quickcode_offset);
     if (thunk_size == 0) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -359,7 +356,6 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     /* Patch target to jump to router thunk */
     if (patch_target(target, entry->thunk, stealth, entry) != 0) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -391,15 +387,9 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
 
     pthread_mutex_lock(&g_engine.lock);
 
-    if (pool_make_writable() != 0) {
-        pthread_mutex_unlock(&g_engine.lock);
-        return NULL;
-    }
-
     size_t stub_alloc = 1024;
     void* stub_mem = hook_alloc(stub_alloc);
     if (!stub_mem) {
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -421,7 +411,6 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
     arm64_writer_clear(&w);
 
     hook_flush_cache(stub_mem, stub_size);
-    pool_make_executable();
 
     pthread_mutex_unlock(&g_engine.lock);
 

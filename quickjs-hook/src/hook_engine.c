@@ -52,9 +52,6 @@ int hook_engine_init(void* exec_mem, size_t size) {
     pthread_mutex_init(&g_engine.lock, NULL);
     g_engine.initialized = 1;
 
-    /* Tighten pool permissions: caller provides RWX, we keep R-X until needed */
-    pool_make_executable();
-
     return 0;
 }
 
@@ -73,9 +70,6 @@ void hook_engine_cleanup(void) {
     if (!g_engine.initialized) return;
 
     pthread_mutex_lock(&g_engine.lock);
-
-    /* Make pool writable for cleanup state reset */
-    pool_make_writable();
 
     /* Restore all hooked target functions to their original bytes. */
     HookEntry* entry = g_engine.hooks;

@@ -27,14 +27,12 @@ void* hook_install(void* target, void* replacement, int stealth) {
 
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
 
     if (patch_target(target, replacement, stealth, entry) != 0) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -231,7 +229,6 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
 
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return HOOK_ERROR_ALLOC_FAILED;
     }
@@ -241,7 +238,6 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     void* thunk_mem = generate_attach_thunk(entry, on_enter, on_leave, user_data, &thunk_size);
     if (!thunk_mem) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return HOOK_ERROR_ALLOC_FAILED;
     }
@@ -249,7 +245,6 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     int patch_result = patch_target(target, thunk_mem, stealth, entry);
     if (patch_result != 0) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return patch_result;
     }
@@ -328,7 +323,6 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
 
     if (build_trampoline(entry) < 0) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -338,14 +332,12 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
     void* thunk_mem = generate_replace_thunk(entry, on_enter, user_data, &thunk_size);
     if (!thunk_mem) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
 
     if (patch_target(target, thunk_mem, stealth, entry) != 0) {
         free_entry(entry);
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -441,12 +433,6 @@ int hook_remove(void* target) {
             }
             hook_flush_cache(target, entry->original_size);
 
-            /* Make pool writable before writing to pool-resident struct fields.
-             * HookEntry nodes live in the exec pool (allocated via hook_alloc).
-             * After installation the pool is R-X, so any write to prev->next or
-             * entry->next without re-enabling PROT_WRITE causes SIGSEGV. */
-            pool_make_writable();
-
             /* Remove from hook list */
             if (prev) {
                 prev->next = entry->next;
@@ -456,9 +442,6 @@ int hook_remove(void* target) {
 
             /* Move to free list for reuse instead of discarding */
             free_entry(entry);
-
-            /* Restore pool to R-X */
-            pool_make_executable();
 
             pthread_mutex_unlock(&g_engine.lock);
             return HOOK_OK;

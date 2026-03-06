@@ -27,6 +27,15 @@ pub(crate) unsafe fn add_cfunction_to_object(
     ffi::JS_FreeAtom(ctx, atom);
 }
 
+/// 读取 /proc/self/maps 并返回内容字符串。
+/// 使用 `String::from_utf8` 快速路径，仅在内容包含非 UTF-8 字节时回退到 lossy 转换。
+pub(crate) fn read_proc_self_maps() -> Option<String> {
+    let bytes = std::fs::read("/proc/self/maps").ok()?;
+    Some(String::from_utf8(bytes).unwrap_or_else(|e| {
+        String::from_utf8_lossy(e.as_bytes()).into_owned()
+    }))
+}
+
 /// Check if [addr, addr+size) is accessible using mincore(2).
 /// Returns false for null/zero or unmapped pages.
 pub(crate) fn is_addr_accessible(addr: u64, size: usize) -> bool {

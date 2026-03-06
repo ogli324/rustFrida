@@ -130,9 +130,9 @@ static LIBART_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::n
 
 /// Parse /proc/self/maps to find the libart.so address range and file path.
 pub(crate) fn probe_libart_range() -> (u64, u64) {
-    let maps = match std::fs::read_to_string("/proc/self/maps") {
-        Ok(s) => s,
-        Err(_) => return (0, 0),
+    let maps = match super::util::read_proc_self_maps() {
+        Some(s) => s,
+        None => return (0, 0),
     };
 
     let mut range_start: u64 = u64::MAX;
@@ -181,9 +181,9 @@ pub(crate) fn probe_libart_range() -> (u64, u64) {
 /// 通过 /proc/self/maps 获取指定模块的地址范围 (start, end)。
 /// 返回 (0, 0) 表示未找到。
 pub(crate) fn probe_module_range(module_name: &str) -> (u64, u64) {
-    let maps = match std::fs::read_to_string("/proc/self/maps") {
-        Ok(s) => s,
-        Err(_) => return (0, 0),
+    let maps = match super::util::read_proc_self_maps() {
+        Some(s) => s,
+        None => return (0, 0),
     };
 
     let mut range_start: u64 = u64::MAX;
@@ -226,9 +226,9 @@ pub(crate) fn probe_module_range(module_name: &str) -> (u64, u64) {
 
 /// Parse /proc/self/maps to find a module's base address.
 fn find_module_base(module_name: &str) -> u64 {
-    let maps = match std::fs::read_to_string("/proc/self/maps") {
-        Ok(s) => s,
-        Err(_) => return 0,
+    let maps = match super::util::read_proc_self_maps() {
+        Some(s) => s,
+        None => return 0,
     };
 
     for line in maps.lines() {
@@ -270,9 +270,9 @@ struct ModuleInfo {
 
 /// Parse /proc/self/maps and aggregate VMAs per unique path.
 fn enumerate_modules_from_maps() -> Vec<ModuleInfo> {
-    let maps = match std::fs::read_to_string("/proc/self/maps") {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    let maps = match super::util::read_proc_self_maps() {
+        Some(s) => s,
+        None => return Vec::new(),
     };
 
     // Collect (path -> (min_start, max_end)) using insertion-order Vec
@@ -640,9 +640,9 @@ struct Elf64ShdrCopy {
 
 /// Find linker64 base address and file path from /proc/self/maps.
 fn find_linker_info() -> (u64, String) {
-    let maps = match std::fs::read_to_string("/proc/self/maps") {
-        Ok(s) => s,
-        Err(_) => return (0, String::new()),
+    let maps = match super::util::read_proc_self_maps() {
+        Some(s) => s,
+        None => return (0, String::new()),
     };
 
     for line in maps.lines() {
@@ -1029,9 +1029,9 @@ fn find_module_base_for_path(path: &str) -> u64 {
     if path.is_empty() {
         return 0;
     }
-    let maps = match std::fs::read_to_string("/proc/self/maps") {
-        Ok(s) => s,
-        Err(_) => return 0,
+    let maps = match super::util::read_proc_self_maps() {
+        Some(s) => s,
+        None => return 0,
     };
     for line in maps.lines() {
         if !line.contains(path) {

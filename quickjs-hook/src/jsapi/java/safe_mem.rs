@@ -53,9 +53,9 @@ pub(super) unsafe fn safe_read_u16(addr: u64) -> u16 {
 
 /// 解析 /proc/self/maps，提取所有可读 ('r') 区间
 fn parse_proc_maps() -> Vec<MemRegion> {
-    let content = match std::fs::read_to_string("/proc/self/maps") {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
+    let content = match crate::jsapi::util::read_proc_self_maps() {
+        Some(s) => s,
+        None => return Vec::new(),
     };
 
     let mut regions = Vec::new();

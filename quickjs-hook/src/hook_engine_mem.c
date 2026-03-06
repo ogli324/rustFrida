@@ -78,18 +78,6 @@ void restore_page_rx(uintptr_t page_start) {
     }
 }
 
-int pool_make_writable(void) {
-    if (!g_engine.exec_mem) return -1;
-    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
-                    PROT_READ | PROT_WRITE | PROT_EXEC);
-}
-
-int pool_make_executable(void) {
-    if (!g_engine.exec_mem) return -1;
-    return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
-                    PROT_READ | PROT_EXEC);
-}
-
 /* --- Entry free list management --- */
 
 HookEntry* alloc_entry(void) {
@@ -130,7 +118,7 @@ void hook_flush_cache(void* start, size_t size) {
     __builtin___clear_cache((char*)start, (char*)start + size);
 }
 
-/* --- wxshadow (three-step shadow page patching) --- */
+/* --- wxshadow (two-step shadow page patching) --- */
 
 /*
  * Find the VMA containing addr by parsing /proc/self/maps.
@@ -203,24 +191,22 @@ static int pmd_split_cow(void* addr) {
 
 /*
  * Stealth-patch target address using wxshadow shadow pages:
- *   1. PREPARE — allocate shadow page, make writable
- *   2. memcpy — write hook bytes to shadow page
- *   3. ACTIVE — switch mapping: reads see original bytes, execution sees shadow
+ *   PATCH — one-step: create shadow + write buf + activate (--x)
  *
- * Tries pid=0 first, then getpid() as fallback for each step.
+ * prctl(PR_WXSHADOW_PATCH, pid, addr, buf, len)
+ * Tries pid=0 first, then getpid() as fallback.
  * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure.
  */
 int wxshadow_patch(void* addr, const void* buf, size_t len) {
     int ret;
 
-    /* Step 1: PREPARE — create writable shadow page */
-    ret = prctl(PR_WXSHADOW_PREPARE, 0, (uintptr_t)addr, 0, 0);
+    ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, len);
     if (ret != 0) {
-        ret = prctl(PR_WXSHADOW_PREPARE, getpid(), (uintptr_t)addr, 0, 0);
+        ret = prctl(PR_WXSHADOW_PATCH, getpid(), (uintptr_t)addr, (uintptr_t)buf, len);
     }
 
     if (ret != 0) {
-        /* PREPARE failed — likely 2MB section (PMD) mapping.
+        /* PATCH failed — likely 2MB section (PMD) mapping.
          * wxshadow only supports 4KB PTE-mapped pages.
          *
          * Split the PMD by triggering COW on the target page.  We must
@@ -228,52 +214,24 @@ int wxshadow_patch(void* addr, const void* buf, size_t len) {
          * to avoid creating a VMA split visible in /proc/self/maps.
          * V-OS detection scans /proc/self/maps for unexpected VMA splits
          * in libart.so — mprotecting a sub-range would fragment the VMA. */
-        hook_log("wxshadow PREPARE failed (errno=%d), trying PMD split + COW for addr=%p", errno, addr);
+        hook_log("wxshadow PATCH failed (errno=%d), trying PMD split + COW for addr=%p", errno, addr);
 
         if (pmd_split_cow(addr) == 0) {
-            ret = prctl(PR_WXSHADOW_PREPARE, 0, (uintptr_t)addr, 0, 0);
+            ret = prctl(PR_WXSHADOW_PATCH, 0, (uintptr_t)addr, (uintptr_t)buf, len);
             if (ret != 0) {
-                ret = prctl(PR_WXSHADOW_PREPARE, getpid(), (uintptr_t)addr, 0, 0);
+                ret = prctl(PR_WXSHADOW_PATCH, getpid(), (uintptr_t)addr, (uintptr_t)buf, len);
             }
         }
 
         if (ret != 0) {
-            hook_log("wxshadow PREPARE failed after COW: addr=%p errno=%d", addr, errno);
+            hook_log("wxshadow PATCH failed after COW: addr=%p errno=%d", addr, errno);
             return HOOK_ERROR_WXSHADOW_FAILED;
         }
-        hook_log("wxshadow PREPARE succeeded after PMD split: addr=%p", addr);
-    }
-
-    /* Step 2: Write hook bytes — page is now writable (shadow page) */
-    memcpy(addr, buf, len);
-
-    /* Step 3: ACTIVE — switch to shadow execution (reads=original, exec=shadow) */
-    ret = prctl(PR_WXSHADOW_ACTIVE, 0, (uintptr_t)addr, 0, 0);
-    if (ret != 0) {
-        ret = prctl(PR_WXSHADOW_ACTIVE, getpid(), (uintptr_t)addr, 0, 0);
-        if (ret != 0) {
-            hook_log("wxshadow ACTIVE failed: addr=%p errno=%d", addr, errno);
-            prctl(PR_WXSHADOW_RELEASE, 0, (uintptr_t)addr, 0, 0);
-            return HOOK_ERROR_WXSHADOW_FAILED;
-        }
+        hook_log("wxshadow PATCH succeeded after PMD split: addr=%p", addr);
     }
 
     hook_log("wxshadow stealth patch OK: addr=%p len=%zu", addr, len);
     return 0;
-}
-
-/*
- * Activate a shadow page that was prepared but not yet activated.
- * Used when the caller handles the write step separately.
- * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure.
- */
-int wxshadow_active(void* addr) {
-    int ret;
-    ret = prctl(PR_WXSHADOW_ACTIVE, 0, (uintptr_t)addr, 0, 0);
-    if (ret == 0) return 0;
-    ret = prctl(PR_WXSHADOW_ACTIVE, getpid(), (uintptr_t)addr, 0, 0);
-    if (ret == 0) return 0;
-    return HOOK_ERROR_WXSHADOW_FAILED;
 }
 
 /*
@@ -452,15 +410,9 @@ HookEntry* setup_hook_entry(void* target) {
         return NULL;
     }
 
-    /* Make pool writable for allocation and code generation */
-    if (pool_make_writable() != 0) {
-        return NULL;
-    }
-
     /* Allocate hook entry (reuse from free list if possible) */
     HookEntry* entry = alloc_entry();
     if (!entry) {
-        pool_make_executable();
         return NULL;
     }
 
@@ -473,7 +425,6 @@ HookEntry* setup_hook_entry(void* target) {
     }
     if (!entry->trampoline) {
         free_entry(entry);
-        pool_make_executable();
         return NULL;
     }
 
@@ -481,7 +432,6 @@ HookEntry* setup_hook_entry(void* target) {
     if (read_target_safe(target, entry->original_bytes, MIN_HOOK_SIZE) != 0) {
         hook_log("setup_hook_entry: target %p is not readable, aborting", target);
         free_entry(entry);
-        pool_make_executable();
         return NULL;
     }
     entry->original_size = MIN_HOOK_SIZE;
@@ -509,9 +459,8 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
 
     if (stealth) {
-        /* Stealth mode: wxshadow three-step patch.
-         * PREPARE creates a writable shadow page, we write the jump directly,
-         * ACTIVE switches mapping so reads see original bytes, execution sees shadow.
+        /* Stealth mode: wxshadow one-step PATCH.
+         * Kernel creates shadow page, copies buf, activates (--x) in one prctl.
          * If wxshadow fails, fall through to mprotect. */
         uint8_t jump_buf[MIN_HOOK_SIZE];
         jump_result = hook_write_jump(jump_buf, jump_dest);
@@ -554,7 +503,4 @@ void finalize_hook(HookEntry* entry, void* thunk, size_t thunk_size) {
     /* Add to hook list */
     entry->next = g_engine.hooks;
     g_engine.hooks = entry;
-
-    /* Tighten pool to R-X */
-    pool_make_executable();
 }

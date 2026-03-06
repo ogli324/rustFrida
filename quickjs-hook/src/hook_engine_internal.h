@@ -18,19 +18,15 @@
 #include <stdio.h>
 #include <errno.h>
 
-/* wxshadow prctl operations - three-step shadow page patching:
- *   1. PREPARE: create shadow page at addr, make writable (rw-)
- *   2. User writes hook bytes to addr (hits shadow page)
- *   3. ACTIVE: switch mapping — reads see original, execution sees shadow (--x)
- *   4. RELEASE: restore original mapping (for unhook)
+/* wxshadow prctl operations - two-step shadow page patching:
+ *   1. PATCH: create shadow + write data + activate (--x) in one step
+ *   2. RELEASE: restore original mapping (for unhook)
  *
- * All operations: prctl(op, pid, addr) where pid=0 means current process.
+ * PATCH: prctl(op, pid, addr, buf, len) where pid=0 means current process.
+ * RELEASE: prctl(op, pid, addr) where pid=0 means current process.
  */
-#ifndef PR_WXSHADOW_PREPARE
-#define PR_WXSHADOW_PREPARE 0x57580006  /* prctl(0x57580006, pid, addr) — create rw- shadow */
-#endif
-#ifndef PR_WXSHADOW_ACTIVE
-#define PR_WXSHADOW_ACTIVE  0x57580007  /* prctl(0x57580007, pid, addr) — switch to --x shadow */
+#ifndef PR_WXSHADOW_PATCH
+#define PR_WXSHADOW_PATCH   0x57580006  /* prctl(0x57580006, pid, addr, buf, len) — one-step patch */
 #endif
 #ifndef PR_WXSHADOW_RELEASE
 #define PR_WXSHADOW_RELEASE 0x57580008  /* prctl(0x57580008, pid, addr) — restore original */
@@ -67,13 +63,10 @@ void hook_log(const char* fmt, ...);
 int page_has_read_perm(uintptr_t addr);
 int read_target_safe(void* target, void* buf, size_t len);
 void restore_page_rx(uintptr_t page_start);
-int pool_make_writable(void);
-int pool_make_executable(void);
 HookEntry* alloc_entry(void);
 void free_entry(HookEntry* entry);
 int wxshadow_patch(void* addr, const void* buf, size_t len);
 int wxshadow_release(void* addr);
-int wxshadow_active(void* addr);
 int write_jump_back(void* dst, void* target, uint32_t written_regs);
 
 /* --- Core (hook_engine.c) --- */
@@ -84,9 +77,8 @@ HookEntry* find_hook(void* target);
 /*
  * Allocate and set up a HookEntry with trampoline.
  *
- * Caller must hold g_engine.lock. On success: pool is writable, entry is allocated
- * with trampoline + original_bytes ready. On failure: returns NULL, lock is still held
- * but pool is restored to executable.
+ * Caller must hold g_engine.lock. On success: entry is allocated
+ * with trampoline + original_bytes ready. On failure: returns NULL, lock is still held.
  *
  * @param target    Address to hook
  * @return          HookEntry* or NULL on failure
@@ -113,7 +105,7 @@ int build_trampoline(HookEntry* entry);
 int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry);
 
 /*
- * Finalize the hook: flush caches, add to hook list, make pool executable.
+ * Finalize the hook: flush caches, add to hook list.
  *
  * @param entry         HookEntry to finalize
  * @param thunk         Thunk pointer (may be NULL for simple replacement)

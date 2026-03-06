@@ -78,15 +78,9 @@ static void* prepare_redirect_entry(uint64_t key, HookRedirectEntry** out_entry)
         cur = cur->next;
     }
 
-    if (pool_make_writable() != 0) {
-        pthread_mutex_unlock(&g_engine.lock);
-        return NULL;
-    }
-
     /* Allocate entry in pool */
     HookRedirectEntry* entry = (HookRedirectEntry*)hook_alloc(sizeof(HookRedirectEntry));
     if (!entry) {
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -95,7 +89,6 @@ static void* prepare_redirect_entry(uint64_t key, HookRedirectEntry** out_entry)
     /* Allocate thunk memory */
     void* thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
     if (!thunk_mem) {
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -116,7 +109,6 @@ static void* finalize_redirect_entry(HookRedirectEntry* entry, uint64_t key,
     g_engine.redirects = entry;
 
     hook_flush_cache(thunk, thunk_size);
-    pool_make_executable();
 
     pthread_mutex_unlock(&g_engine.lock);
     return thunk;
@@ -138,7 +130,6 @@ void* hook_create_redirect(uint64_t key, void* original_entry,
     void* thunk = generate_redirect_thunk(original_entry, on_enter, user_data,
                                            thunk_mem, &thunk_size);
     if (!thunk) {
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
@@ -159,15 +150,12 @@ void* hook_remove_redirect(uint64_t key) {
         if (entry->key == key) {
             void* original = entry->original_entry;
 
-            pool_make_writable();
-
             if (prev) {
                 prev->next = entry->next;
             } else {
                 g_engine.redirects = entry->next;
             }
 
-            pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
             return original;
         }
@@ -228,7 +216,6 @@ void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* u
     size_t thunk_size = 0;
     void* thunk = generate_native_hook_thunk(on_enter, user_data, thunk_mem, &thunk_size);
     if (!thunk) {
-        pool_make_executable();
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
     }
