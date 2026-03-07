@@ -307,7 +307,8 @@ static void* resolve_art_trampoline(void* target, void* jni_env) {
  * ============================================================================ */
 
 void* hook_install_art_router(void* target, uint32_t quickcode_offset,
-                               int stealth, void* jni_env) {
+                               int stealth, void* jni_env,
+                               void** out_hooked_target) {
     if (!g_engine.initialized || !target) {
         return NULL;
     }
@@ -317,6 +318,11 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
     if (resolved != target) {
         hook_log("[art_router] resolved %p → %p", target, resolved);
         target = resolved;
+    }
+
+    /* Report the actual hooked address back to the caller for cleanup */
+    if (out_hooked_target) {
+        *out_hooked_target = target;
     }
 
     pthread_mutex_lock(&g_engine.lock);

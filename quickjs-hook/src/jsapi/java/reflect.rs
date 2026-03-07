@@ -170,6 +170,96 @@ unsafe impl Sync for ReflectIds {}
 
 pub(super) static REFLECT_IDS: std::sync::OnceLock<ReflectIds> = std::sync::OnceLock::new();
 
+// ClassLoader 动态覆盖：spawn 模式下 jsinit 时 ClassLoader 不可用，
+// Java.ready() gate 触发后通过 update_app_classloader() 设置。
+use std::sync::atomic::AtomicU64;
+/// app ClassLoader global ref（由 Java._updateClassLoader 设置）
+pub(super) static CL_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+/// ClassLoader.loadClass method ID（随 CL_OVERRIDE 一起设置）
+pub(super) static LC_MID_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// 绕过 Android hidden API 限制。
+/// 调用 VMRuntime.getRuntime().setHiddenApiExemptions(new String[]{""})
+/// 使所有隐藏 API 对反射可见（getDeclaredFields 等不再过滤）。
+unsafe fn bypass_hidden_api_restrictions(env: JniEnv) {
+    let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
+    let get_static_mid: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
+    let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+    let call_static_obj: CallStaticObjectMethodAFn =
+        jni_fn!(env, CallStaticObjectMethodAFn, JNI_CALL_STATIC_OBJECT_METHOD_A);
+    let call_void: CallVoidMethodAFn = jni_fn!(env, CallVoidMethodAFn, JNI_CALL_VOID_METHOD_A);
+    let new_string_utf: NewStringUtfFn = jni_fn!(env, NewStringUtfFn, JNI_NEW_STRING_UTF);
+    let new_obj_array: NewObjectArrayFn = jni_fn!(env, NewObjectArrayFn, JNI_NEW_OBJECT_ARRAY);
+    let set_obj_array_elem: SetObjectArrayElementFn =
+        jni_fn!(env, SetObjectArrayElementFn, JNI_SET_OBJECT_ARRAY_ELEMENT);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    // 1. FindClass("dalvik/system/VMRuntime")
+    let c_vmrt = CString::new("dalvik/system/VMRuntime").unwrap();
+    let vmrt_cls = find_class(env, c_vmrt.as_ptr());
+    if vmrt_cls.is_null() || jni_check_exc(env) {
+        output_message("[java] hidden API bypass: VMRuntime class not found (pre-Android 9?)");
+        return;
+    }
+
+    // 2. VMRuntime.getRuntime() → VMRuntime instance
+    let c_get_runtime = CString::new("getRuntime").unwrap();
+    let c_get_runtime_sig = CString::new("()Ldalvik/system/VMRuntime;").unwrap();
+    let get_runtime_mid = get_static_mid(env, vmrt_cls, c_get_runtime.as_ptr(), c_get_runtime_sig.as_ptr());
+    if get_runtime_mid.is_null() || jni_check_exc(env) {
+        delete_local_ref(env, vmrt_cls);
+        output_message("[java] hidden API bypass: getRuntime() not found");
+        return;
+    }
+    let runtime = call_static_obj(env, vmrt_cls, get_runtime_mid, std::ptr::null());
+    if runtime.is_null() || jni_check_exc(env) {
+        delete_local_ref(env, vmrt_cls);
+        output_message("[java] hidden API bypass: getRuntime() returned null");
+        return;
+    }
+
+    // 3. setHiddenApiExemptions(String[])
+    let c_set = CString::new("setHiddenApiExemptions").unwrap();
+    let c_set_sig = CString::new("([Ljava/lang/String;)V").unwrap();
+    let set_mid = get_mid(env, vmrt_cls, c_set.as_ptr(), c_set_sig.as_ptr());
+    if set_mid.is_null() || jni_check_exc(env) {
+        delete_local_ref(env, runtime);
+        delete_local_ref(env, vmrt_cls);
+        output_message("[java] hidden API bypass: setHiddenApiExemptions not found (pre-Android 10?)");
+        return;
+    }
+
+    // 4. 构造 new String[]{""} — 空前缀匹配所有 API
+    let c_str_cls = CString::new("java/lang/String").unwrap();
+    let str_cls = find_class(env, c_str_cls.as_ptr());
+    if str_cls.is_null() || jni_check_exc(env) {
+        delete_local_ref(env, runtime);
+        delete_local_ref(env, vmrt_cls);
+        return;
+    }
+    let c_empty = CString::new("").unwrap();
+    let empty_str = new_string_utf(env, c_empty.as_ptr());
+    let arr = new_obj_array(env, 1, str_cls, std::ptr::null_mut());
+    if !arr.is_null() && !empty_str.is_null() {
+        set_obj_array_elem(env, arr, 0, empty_str);
+
+        // 5. 调用: runtime.setHiddenApiExemptions(arr)
+        let args: [*mut std::ffi::c_void; 1] = [arr];
+        call_void(env, runtime, set_mid, args.as_ptr() as *const std::ffi::c_void);
+        if jni_check_exc(env) {
+            output_message("[java] hidden API bypass: setHiddenApiExemptions threw exception");
+        } else {
+            output_message("[java] hidden API bypass: setHiddenApiExemptions(\"\") OK");
+        }
+    }
+
+    if !arr.is_null() { delete_local_ref(env, arr); }
+    if !empty_str.is_null() { delete_local_ref(env, empty_str); }
+    delete_local_ref(env, str_cls);
+    delete_local_ref(env, runtime);
+    delete_local_ref(env, vmrt_cls);
+}
+
 /// Cache reflection method IDs. Must be called from a safe thread (not a hook callback)
 /// because it uses FindClass which triggers ART stack walking.
 pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
@@ -178,6 +268,11 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
         // 优先使用 DecodeMethodId/DecodeFieldId dlsym 直接调用
         // 仅当 decode 函数不可用时才 fallback 强制写 kPointer
         super::jni_core::init_jni_id_decoder();
+
+        // --- 绕过 Android hidden API 过滤 (API 28+) ---
+        // VMRuntime.setHiddenApiExemptions(new String[]{""}) 将所有隐藏 API 豁免，
+        // 使 getDeclaredFields() 能返回 mPackageName 等被过滤的字段。
+        bypass_hidden_api_restrictions(env);
 
         let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
         let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
@@ -347,6 +442,46 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
     });
 }
 
+/// 更新 app ClassLoader（由 Java.ready() gate hook 在 Instrumentation.newApplication 中调用）。
+/// 将 local ref 转为 global ref 并缓存 loadClass method ID。
+pub(super) unsafe fn update_app_classloader(env: JniEnv, cl_local: *mut std::ffi::c_void) {
+    if cl_local.is_null() { return; }
+
+    let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
+    let gl = new_global_ref(env, cl_local);
+    if gl.is_null() { return; }
+
+    CL_OVERRIDE.store(gl as u64, std::sync::atomic::Ordering::Release);
+
+    // 缓存 loadClass method ID（只需设置一次）
+    if LC_MID_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
+        let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+        let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+        let c_cl_cls = CString::new("java/lang/ClassLoader").unwrap();
+        let cl_cls = find_class(env, c_cl_cls.as_ptr());
+        if !cl_cls.is_null() && !jni_check_exc(env) {
+            let c_lc = CString::new("loadClass").unwrap();
+            let c_lc_sig = CString::new("(Ljava/lang/String;)Ljava/lang/Class;").unwrap();
+            let lc_mid = get_mid(env, cl_cls, c_lc.as_ptr(), c_lc_sig.as_ptr());
+            if !lc_mid.is_null() && !jni_check_exc(env) {
+                LC_MID_OVERRIDE.store(lc_mid as u64, std::sync::atomic::Ordering::Release);
+            }
+            delete_local_ref(env, cl_cls);
+        }
+        jni_check_exc(env);
+    }
+}
+
+/// 检查 app ClassLoader 是否可用（init 阶段或 override 阶段均算）
+pub(super) fn is_classloader_ready() -> bool {
+    if CL_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        return true;
+    }
+    REFLECT_IDS.get().map_or(false, |r| !r.app_classloader.is_null())
+}
+
 /// Find a Java class by name. Tries JNI FindClass first (works for system/framework classes),
 /// then falls back to ClassLoader.loadClass() for app classes.
 /// `class_name` can use either `.` or `/` notation.
@@ -372,14 +507,21 @@ pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std:
     // FindClass failed — clear exception and try ClassLoader.loadClass
     jni_check_exc(env);
 
-    let reflect = match REFLECT_IDS.get() {
-        Some(r) => r,
-        None => return std::ptr::null_mut(),
+    // 优先使用 CL_OVERRIDE（Java.ready gate 设置），fallback 到 REFLECT_IDS 初始化阶段捕获的值
+    let (app_cl, lc_mid) = {
+        let ovr_cl = CL_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+        let ovr_mid = LC_MID_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+        if ovr_cl != 0 && ovr_mid != 0 {
+            (ovr_cl as *mut std::ffi::c_void, ovr_mid as *mut std::ffi::c_void)
+        } else {
+            match REFLECT_IDS.get() {
+                Some(r) if !r.app_classloader.is_null() && !r.load_class_mid.is_null() => {
+                    (r.app_classloader, r.load_class_mid)
+                }
+                _ => return std::ptr::null_mut(),
+            }
+        }
     };
-
-    if reflect.app_classloader.is_null() || reflect.load_class_mid.is_null() {
-        return std::ptr::null_mut();
-    }
 
     // ClassLoader.loadClass uses '.' notation
     let dot_name = class_name.replace('/', ".");
@@ -399,7 +541,7 @@ pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std:
     }
 
     let args: [*mut std::ffi::c_void; 1] = [jstr];
-    let result = call_obj(env, reflect.app_classloader, reflect.load_class_mid,
+    let result = call_obj(env, app_cl, lc_mid,
                           args.as_ptr() as *const std::ffi::c_void);
     delete_local_ref(env, jstr);
 

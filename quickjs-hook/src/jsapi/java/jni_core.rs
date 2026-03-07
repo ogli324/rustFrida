@@ -87,6 +87,9 @@ pub(super) type DeleteLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c
 pub(super) type NewLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type NewGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type DeleteGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void);
+pub(super) type GetObjectClassFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void;
 pub(super) type GetFieldIdFn = unsafe extern "C" fn(
     JniEnv, *mut std::ffi::c_void, *const c_char, *const c_char,
 ) -> *mut std::ffi::c_void;
@@ -143,6 +146,18 @@ pub(super) type GetDoubleFieldFn = unsafe extern "C" fn(
 pub(super) type GetObjectFieldFn = unsafe extern "C" fn(
     JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
 ) -> *mut std::ffi::c_void;
+
+// Void method call (instance)
+pub(super) type CallVoidMethodAFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void,
+);
+// Object array creation/mutation
+pub(super) type NewObjectArrayFn = unsafe extern "C" fn(
+    JniEnv, i32, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void;
+pub(super) type SetObjectArrayElementFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, i32, *mut std::ffi::c_void,
+);
 
 // Static field getter types (signature: env, cls, fid → value)
 pub(super) type GetStaticFieldIdFn = unsafe extern "C" fn(
@@ -541,8 +556,17 @@ pub(super) const JNI_CALL_STATIC_LONG_METHOD_A: usize = 134;
 pub(super) const JNI_CALL_STATIC_FLOAT_METHOD_A: usize = 137;
 pub(super) const JNI_CALL_STATIC_DOUBLE_METHOD_A: usize = 140;
 
+// Void method call (instance)
+pub(super) const JNI_CALL_VOID_METHOD_A: usize = 63;
+// Object array
+pub(super) const JNI_NEW_OBJECT_ARRAY: usize = 172;
+pub(super) const JNI_SET_OBJECT_ARRAY_ELEMENT: usize = 174;
+
 // Ref management
 pub(super) const JNI_DELETE_GLOBAL_REF: usize = 22;
+
+// Object class query
+pub(super) const JNI_GET_OBJECT_CLASS: usize = 31;
 
 // Field access & reflection
 pub(super) const JNI_IS_INSTANCE_OF: usize = 32;

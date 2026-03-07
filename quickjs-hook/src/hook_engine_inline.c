@@ -414,11 +414,49 @@ int hook_remove(void* target) {
     while (entry) {
         if (entry->target == target) {
             if (entry->stealth) {
-                /* Stealth hook: release shadow pages to restore original view */
-                int rc = wxshadow_release(target);
-                if (rc != 0) {
-                    pthread_mutex_unlock(&g_engine.lock);
-                    return HOOK_ERROR_WXSHADOW_FAILED;
+                if (g_engine.bulk_cleanup) {
+                    /* Bulk cleanup: skip everything.
+                     * hook_engine_cleanup() → wxshadow_release_all() handles them. */
+                } else if (g_engine.batch_mode) {
+                    /* Batch mode: defer release + re-patch to hook_end_batch().
+                     * Just track which pages are dirty. */
+                    uintptr_t pg_start = (uintptr_t)target & ~0xFFFUL;
+                    uintptr_t pg_end = ((uintptr_t)target + entry->original_size - 1) & ~0xFFFUL;
+                    for (uintptr_t pg = pg_start; pg <= pg_end; pg += 0x1000) {
+                        batch_add_dirty_page(pg);
+                    }
+                } else {
+                    /* Stealth hook: release shadow pages covering this hook.
+                     * wxshadow RELEASE works at page granularity — releasing a page
+                     * also removes patches of other stealth hooks on the same page.
+                     * After release, re-patch any surviving stealth hooks on the
+                     * affected pages.
+                     *
+                     * NOTE: stealth hooks CANNOT be removed via mprotect+memcpy —
+                     * the shadow page is a kernel-level instruction-view overlay;
+                     * data-view writes do not affect it.  If wxshadow_release fails,
+                     * the hook stays active permanently. */
+                    int rc = wxshadow_release(target, entry->original_size);
+                    if (rc != 0) {
+                        hook_log("hook_remove: wxshadow_release FAILED for %p (stealth hook stays active)", target);
+                        pthread_mutex_unlock(&g_engine.lock);
+                        return HOOK_ERROR_WXSHADOW_FAILED;
+                    }
+                    /* Re-patch surviving stealth hooks on the same page(s) */
+                    uintptr_t rel_start = (uintptr_t)target & ~0xFFFUL;
+                    uintptr_t rel_end = ((uintptr_t)target + entry->original_size - 1) & ~0xFFFUL;
+                    for (HookEntry* other = g_engine.hooks; other; other = other->next) {
+                        if (other == entry || !other->stealth) continue;
+                        uintptr_t other_page = (uintptr_t)other->target & ~0xFFFUL;
+                        if (other_page >= rel_start && other_page <= rel_end) {
+                            uint8_t jump_buf[MIN_HOOK_SIZE];
+                            void* jump_dest = other->thunk ? other->thunk : other->replacement;
+                            int jlen = hook_write_jump(jump_buf, jump_dest);
+                            if (jlen > 0) {
+                                wxshadow_patch(other->target, jump_buf, jlen);
+                            }
+                        }
+                    }
                 }
             } else {
                 /* Normal hook: restore original bytes via mprotect + memcpy */
@@ -431,7 +469,12 @@ int hook_remove(void* target) {
                 /* Restore target page from RWX to R-X after writing original bytes back */
                 restore_page_rx(page_start);
             }
-            hook_flush_cache(target, entry->original_size);
+            /* Skip cache flush for stealth+bulk: shadow pages will be released
+             * by wxshadow_release_all(), and __builtin___clear_cache hangs on
+             * wxshadow pages (kernel D-state). */
+            if (!(entry->stealth && g_engine.bulk_cleanup)) {
+                hook_flush_cache(target, entry->original_size);
+            }
 
             /* Remove from hook list */
             if (prev) {

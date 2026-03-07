@@ -85,6 +85,27 @@ pub fn cleanup_hook_engine() {
     }
 }
 
+/// Enter bulk cleanup mode: skip per-hook wxshadow release + re-patch
+pub fn begin_bulk_cleanup() {
+    unsafe {
+        ffi::hook::hook_engine_begin_bulk_cleanup();
+    }
+}
+
+/// Begin batch unhook: defer wxshadow release + re-patch to end_batch()
+pub fn begin_batch() {
+    unsafe {
+        ffi::hook::hook_begin_batch();
+    }
+}
+
+/// End batch unhook: release dirty pages once, re-patch survivors
+pub fn end_batch() {
+    unsafe {
+        ffi::hook::hook_end_batch();
+    }
+}
+
 /// High-level JS engine wrapper
 /// Note: Field order matters for drop order - context must be dropped before runtime
 pub struct JSEngine {

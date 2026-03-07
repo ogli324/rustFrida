@@ -235,15 +235,38 @@ int wxshadow_patch(void* addr, const void* buf, size_t len) {
 }
 
 /*
- * Release wxshadow shadow at addr — restore original mapping.
- * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED on failure.
+ * Release wxshadow shadow pages covering [addr, addr+len).
+ * wxshadow RELEASE operates on page granularity, so we iterate over
+ * every page touched by the range and release each one.
+ * Returns 0 on success, HOOK_ERROR_WXSHADOW_FAILED if any page fails.
  */
-int wxshadow_release(void* addr) {
-    int ret;
-    ret = prctl(PR_WXSHADOW_RELEASE, 0, (uintptr_t)addr, 0, 0);
+int wxshadow_release(void* addr, size_t len) {
+    uintptr_t start_page = (uintptr_t)addr & ~0xFFFUL;
+    uintptr_t end_page = ((uintptr_t)addr + len - 1) & ~0xFFFUL;
+
+    for (uintptr_t page = start_page; page <= end_page; page += 0x1000) {
+        int ret = prctl(PR_WXSHADOW_RELEASE, 0, page, 0, 0);
+        if (ret != 0) {
+            ret = prctl(PR_WXSHADOW_RELEASE, getpid(), page, 0, 0);
+        }
+        if (ret != 0) {
+            hook_log("wxshadow_release: failed for page %p (errno=%d)", (void*)page, errno);
+            return HOOK_ERROR_WXSHADOW_FAILED;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Release ALL wxshadow shadow pages for the current process.
+ * addr=0 tells the kernel to teardown every shadow page in this mm.
+ */
+int wxshadow_release_all(void) {
+    int ret = prctl(PR_WXSHADOW_RELEASE, 0, 0, 0, 0);
     if (ret == 0) return 0;
-    ret = prctl(PR_WXSHADOW_RELEASE, getpid(), (uintptr_t)addr, 0, 0);
+    ret = prctl(PR_WXSHADOW_RELEASE, getpid(), 0, 0, 0);
     if (ret == 0) return 0;
+    hook_log("wxshadow_release_all: failed (errno=%d)", errno);
     return HOOK_ERROR_WXSHADOW_FAILED;
 }
 

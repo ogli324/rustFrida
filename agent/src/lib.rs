@@ -112,8 +112,8 @@ pub struct AgentArgs {
 pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     // 安装Rust panic hook（需要在最前面，捕获Rust层面的panic）
     install_panic_hook();
-    // 安装崩溃信号处理器（捕获SIGSEGV等信号）
-    install_crash_handlers();
+    // 崩溃信号处理器暂时禁用，让系统生成标准 tombstone 以便调试
+    // install_crash_handlers();
 
     // 从 AgentArgs 读取 ctrl_fd 和 StringTable 指针
     let (ctrl_fd, table) = unsafe {
@@ -272,8 +272,10 @@ fn process_cmd(command: &str) {
                 write_stream(b"EVAL:cleaned up\n");
             }
         }
-        // shutdown — 清理资源并退出 agent 主循环
+        // shutdown — 关闭 socket 让 host 立即收到 EOF，然后清理资源
         Some("shutdown") => {
+            // 先关闭 socket，host 收到 EOF 即可退出，不必等待 agent cleanup 完成
+            shutdown_stream();
             #[cfg(feature = "quickjs")]
             if quickjs_loader::is_initialized() {
                 quickjs_loader::cleanup();

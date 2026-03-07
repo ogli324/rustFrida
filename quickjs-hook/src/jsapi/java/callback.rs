@@ -50,6 +50,8 @@ pub(super) struct JavaHookData {
     pub(super) class_global_ref: usize,
     // Return type char from JNI signature: b'V', b'I', b'J', b'Z', b'L', etc.
     pub(super) return_type: u8,
+    // Full return type descriptor from signature (e.g. "V", "I", "Ljava/lang/String;", "[B")
+    pub(super) return_type_sig: String,
     // JS callback info
     pub(super) ctx: usize,
     pub(super) callback_bytes: [u8; 16],
@@ -85,6 +87,16 @@ pub(super) fn get_return_type_from_sig(sig: &str) -> u8 {
         }
     } else {
         b'V'
+    }
+}
+
+/// Extract the full return type descriptor from a JNI method signature.
+/// "(II)V" → "V", "(I)Ljava/lang/String;" → "Ljava/lang/String;", "()[B" → "[B"
+pub(super) fn get_return_type_sig(sig: &str) -> String {
+    if let Some(pos) = sig.rfind(')') {
+        sig[pos + 1..].to_string()
+    } else {
+        "V".to_string()
     }
 }
 
@@ -217,7 +229,198 @@ macro_rules! dispatch_and_convert {
     }};
 }
 
-/// JS CFunction: ctx.callOriginal()
+/// Convert a JS value to a JNI jvalue (u64) based on the parameter type descriptor.
+///
+/// Handles: primitives (Z/B/C/S/I/J/F/D), String (JS string → NewStringUTF),
+/// objects ({__jptr} or Proxy → extract raw pointer), BigUint64 (raw pointer),
+/// null/undefined → 0.
+unsafe fn marshal_js_to_jvalue(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    val: JSValue,
+    type_sig: Option<&str>,
+) -> u64 {
+    if val.is_null() || val.is_undefined() {
+        return 0;
+    }
+
+    let sig = match type_sig {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            // No type info — try number or bigint
+            if let Some(v) = val.to_u64(ctx) { return v; }
+            if let Some(v) = val.to_i64(ctx) { return v as u64; }
+            return 0;
+        }
+    };
+
+    match sig.as_bytes()[0] {
+        b'Z' => {
+            if let Some(b) = val.to_bool() { b as u64 }
+            else if let Some(n) = val.to_i64(ctx) { (n != 0) as u64 }
+            else { 0 }
+        }
+        b'B' | b'S' | b'I' => {
+            if let Some(n) = val.to_i64(ctx) { n as u64 }
+            else { 0 }
+        }
+        b'C' => {
+            // char: JS string (first char) or number
+            if let Some(s) = val.to_string(ctx) {
+                s.chars().next().map(|c| c as u64).unwrap_or(0)
+            } else if let Some(n) = val.to_i64(ctx) {
+                n as u64
+            } else { 0 }
+        }
+        b'J' => {
+            if let Some(v) = val.to_u64(ctx) { v }
+            else if let Some(v) = val.to_i64(ctx) { v as u64 }
+            else { 0 }
+        }
+        b'F' => {
+            if let Some(f) = val.to_float() {
+                (f as f32).to_bits() as u64
+            } else { 0 }
+        }
+        b'D' => {
+            if let Some(f) = val.to_float() {
+                f.to_bits()
+            } else { 0 }
+        }
+        b'L' | b'[' => {
+            // JS string → NewStringUTF (must check before to_u64, which coerces strings to NaN→0)
+            if val.is_string() {
+                if sig == "Ljava/lang/String;" {
+                    if let Some(s) = val.to_string(ctx) {
+                        let cstr = match CString::new(s) {
+                            Ok(c) => c,
+                            Err(_) => return 0,
+                        };
+                        let new_str: NewStringUtfFn = jni_fn!(env, NewStringUtfFn, JNI_NEW_STRING_UTF);
+                        let jstr = new_str(env, cstr.as_ptr());
+                        return jstr as u64;
+                    }
+                }
+                // Non-String object param with string value — toString won't help, return 0
+                return 0;
+            }
+            // JS object → try __jptr property (Proxy-wrapped or {__jptr, __jclass})
+            if val.is_object() {
+                let jptr_val = val.get_property(ctx, "__jptr");
+                if !jptr_val.is_undefined() && !jptr_val.is_null() {
+                    let result = jptr_val.to_u64(ctx).unwrap_or(0);
+                    jptr_val.free(ctx);
+                    return result;
+                }
+                jptr_val.free(ctx);
+            }
+            // BigUint64 or number (raw jobject pointer)
+            if let Some(v) = val.to_u64(ctx) {
+                return v;
+            }
+            0
+        }
+        _ => {
+            if let Some(v) = val.to_u64(ctx) { v }
+            else if let Some(v) = val.to_i64(ctx) { v as u64 }
+            else { 0 }
+        }
+    }
+}
+
+/// Invoke cloned ArtMethod via JNI using provided jvalue args.
+///
+/// Shared by `js_call_original` (JS callback) and fallback path (JS engine busy).
+/// Returns the raw u64 return value for writing to HookContext.x[0].
+/// For void methods, returns 0.
+unsafe fn invoke_clone_jni(
+    env: JniEnv,
+    art_method_addr: u64,
+    clone_addr: u64,
+    class_global_ref: usize,
+    this_obj: u64,
+    return_type: u8,
+    is_static: bool,
+    jargs_ptr: *const std::ffi::c_void,
+) -> u64 {
+    // Sync declaring_class_ (offset 0, 4B GcRoot): original → clone
+    let declaring_class = std::ptr::read_volatile(art_method_addr as *const u32);
+    std::ptr::write_volatile(clone_addr as *mut u32, declaring_class);
+    jni_check_exc(env);
+
+    let clone_mid = clone_addr as *mut std::ffi::c_void;
+    let cls = class_global_ref as *mut std::ffi::c_void;
+    let this_ptr = this_obj as *mut std::ffi::c_void;
+
+    match return_type {
+        b'V' => {
+            dispatch_call!(env, JNI_CALL_STATIC_VOID_METHOD_A, JNI_CALL_NONVIRTUAL_VOID_METHOD_A,
+                           cls, this_ptr, clone_mid, jargs_ptr, is_static, ());
+            jni_check_exc(env);
+            0
+        }
+        b'Z' => {
+            let ret: u8 = dispatch_call!(env, JNI_CALL_STATIC_BOOLEAN_METHOD_A, JNI_CALL_NONVIRTUAL_BOOLEAN_METHOD_A,
+                                          cls, this_ptr, clone_mid, jargs_ptr, is_static, u8);
+            jni_check_exc(env);
+            ret as u64
+        }
+        b'I' | b'B' | b'C' | b'S' => {
+            let ret: i32 = dispatch_call!(env, JNI_CALL_STATIC_INT_METHOD_A, JNI_CALL_NONVIRTUAL_INT_METHOD_A,
+                                           cls, this_ptr, clone_mid, jargs_ptr, is_static, i32);
+            jni_check_exc(env);
+            ret as u64
+        }
+        b'J' => {
+            let ret: i64 = dispatch_call!(env, JNI_CALL_STATIC_LONG_METHOD_A, JNI_CALL_NONVIRTUAL_LONG_METHOD_A,
+                                           cls, this_ptr, clone_mid, jargs_ptr, is_static, i64);
+            jni_check_exc(env);
+            ret as u64
+        }
+        b'F' => {
+            let ret: f32 = dispatch_call!(env, JNI_CALL_STATIC_FLOAT_METHOD_A, JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A,
+                                           cls, this_ptr, clone_mid, jargs_ptr, is_static, f32);
+            jni_check_exc(env);
+            ret.to_bits() as u64
+        }
+        b'D' => {
+            let ret: f64 = dispatch_call!(env, JNI_CALL_STATIC_DOUBLE_METHOD_A, JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A,
+                                           cls, this_ptr, clone_mid, jargs_ptr, is_static, f64);
+            jni_check_exc(env);
+            ret.to_bits()
+        }
+        b'L' | b'[' => {
+            let ret: *mut std::ffi::c_void = dispatch_call!(env, JNI_CALL_STATIC_OBJECT_METHOD_A, JNI_CALL_NONVIRTUAL_OBJECT_METHOD_A,
+                                                            cls, this_ptr, clone_mid, jargs_ptr, is_static, *mut std::ffi::c_void);
+            jni_check_exc(env);
+            ret as u64
+        }
+        _ => 0,
+    }
+}
+
+/// Build jvalue args from HookContext registers (ARM64 JNI calling convention).
+unsafe fn build_jargs_from_registers(
+    hook_ctx: &hook_ffi::HookContext,
+    param_count: usize,
+    param_types: &[String],
+) -> Vec<u64> {
+    let mut jargs: Vec<u64> = Vec::with_capacity(param_count);
+    let mut gp_index: usize = 0;
+    let mut fp_index: usize = 0;
+    for i in 0..param_count {
+        let type_sig = param_types.get(i).map(|s| s.as_str());
+        let (gp_val, fp_val) = extract_jni_arg(hook_ctx, is_floating_point_type(type_sig), &mut gp_index, &mut fp_index);
+        jargs.push(if is_floating_point_type(type_sig) { fp_val } else { gp_val });
+    }
+    jargs
+}
+
+/// JS CFunction: ctx.callOriginal() or ctx.callOriginal(arg0, arg1, ...)
+///
+/// No arguments: invokes the clone with the original register arguments.
+/// With arguments: invokes the clone with user-specified arguments (JS → jvalue conversion).
+///
 /// Invokes the cloned ArtMethod via JNI CallNonvirtual*MethodA / CallStatic*MethodA.
 /// Returns the method's return value as a JS value.
 ///
@@ -238,7 +441,7 @@ unsafe extern "C" fn js_call_original(
     }
 
     // Look up hook data for clone info
-    let (clone_addr, class_global_ref, return_type, param_count, is_static, param_types) = {
+    let (clone_addr, class_global_ref, return_type, return_type_sig, param_count, is_static, param_types) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -261,7 +464,9 @@ unsafe extern "C" fn js_call_original(
                 );
             }
         };
-        (data.clone_addr, data.class_global_ref, data.return_type, data.param_count, data.is_static,
+        (data.clone_addr, data.class_global_ref, data.return_type,
+         data.return_type_sig.clone(),
+         data.param_count, data.is_static,
          data.param_types.clone())
     }; // lock released
 
@@ -286,71 +491,55 @@ unsafe extern "C" fn js_call_original(
         e
     };
 
-    // Build jvalue args from HookContext registers (ARM64 JNI calling convention).
-    let mut jargs: Vec<u64> = Vec::with_capacity(param_count);
-    let mut gp_index: usize = 0;
-    let mut fp_index: usize = 0;
-    for i in 0..param_count {
-        let type_sig = param_types.get(i).map(|s| s.as_str());
-        let (gp_val, fp_val) = extract_jni_arg(hook_ctx, is_floating_point_type(type_sig), &mut gp_index, &mut fp_index);
-        jargs.push(if is_floating_point_type(type_sig) { fp_val } else { gp_val });
-    }
+    // Build jvalue args: from user-specified JS args (if provided), or from registers.
+    let jargs = if _argc > 0 && !_argv.is_null() {
+        // User-specified arguments: convert JS values → jvalue
+        let mut args: Vec<u64> = Vec::with_capacity(param_count);
+        for i in 0..param_count {
+            let type_sig = param_types.get(i).map(|s| s.as_str());
+            if (i as i32) < _argc {
+                let js_arg = JSValue(*_argv.add(i));
+                args.push(marshal_js_to_jvalue(ctx, env, js_arg, type_sig));
+            } else {
+                // 不足的参数用原始寄存器值补齐
+                let mut gp = i;
+                let mut fp = i;
+                let (gp_val, fp_val) = extract_jni_arg(hook_ctx, is_floating_point_type(type_sig), &mut gp, &mut fp);
+                args.push(if is_floating_point_type(type_sig) { fp_val } else { gp_val });
+            }
+        }
+        args
+    } else {
+        // No arguments: use original register values
+        build_jargs_from_registers(hook_ctx, param_count, &param_types)
+    };
     let jargs_ptr = if param_count > 0 {
         jargs.as_ptr() as *const std::ffi::c_void
     } else {
         std::ptr::null()
     };
 
-    // Use clone_addr as jmethodID — it's heap-allocated with 8-byte alignment (bit 0 = 0),
-    // so ART treats it as a raw ArtMethod* pointer (not encoded).
-    let clone_mid = clone_addr as *mut std::ffi::c_void;
-    let cls = class_global_ref as *mut std::ffi::c_void;
-    let this_obj = hook_ctx.x[1] as *mut std::ffi::c_void;
+    // Invoke clone via shared JNI helper
+    let ret_raw = invoke_clone_jni(
+        env, art_method_addr, clone_addr, class_global_ref,
+        hook_ctx.x[1], return_type, is_static, jargs_ptr,
+    );
 
-    // 同步 clone 的 declaring_class_ (offset 0, 4B GcRoot): original → clone
-    // clone 是堆分配的，不在 GC 根集中，GC 移动 declaring class 后 clone 的值可能过期
-    let declaring_class = std::ptr::read_volatile(art_method_addr as *const u32);
-    std::ptr::write_volatile(clone_addr as *mut u32, declaring_class);
-
-    // Clear any pending exception before calling original
-    jni_check_exc(env);
-
+    // Convert raw return value to JS value
     match return_type {
-        b'V' => {
-            dispatch_call!(env, JNI_CALL_STATIC_VOID_METHOD_A, JNI_CALL_NONVIRTUAL_VOID_METHOD_A,
-                           cls, this_obj, clone_mid, jargs_ptr, is_static, ());
-            if jni_check_exc(env) {
-                if is_static {
-                    output_message("[callOriginal] JNI exception in static void call");
-                } else {
-                    output_message("[callOriginal] JNI exception in nonvirtual void call");
-                }
-            }
-            ffi::qjs_undefined()
-        }
-        b'Z' => dispatch_and_convert!(env, JNI_CALL_STATIC_BOOLEAN_METHOD_A, JNI_CALL_NONVIRTUAL_BOOLEAN_METHOD_A,
-                    cls, this_obj, clone_mid, jargs_ptr, is_static, u8, |ret: u8| JSValue::bool(ret != 0).raw()),
-        b'I' | b'B' | b'C' | b'S' => dispatch_and_convert!(env, JNI_CALL_STATIC_INT_METHOD_A, JNI_CALL_NONVIRTUAL_INT_METHOD_A,
-                    cls, this_obj, clone_mid, jargs_ptr, is_static, i32, |ret: i32| JSValue::int(ret).raw()),
-        b'J' => dispatch_and_convert!(env, JNI_CALL_STATIC_LONG_METHOD_A, JNI_CALL_NONVIRTUAL_LONG_METHOD_A,
-                    cls, this_obj, clone_mid, jargs_ptr, is_static, i64, |ret: i64| ffi::JS_NewBigUint64(ctx, ret as u64)),
-        b'F' => dispatch_and_convert!(env, JNI_CALL_STATIC_FLOAT_METHOD_A, JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A,
-                    cls, this_obj, clone_mid, jargs_ptr, is_static, f32, |ret: f32| JSValue::float(ret as f64).raw()),
-        b'D' => dispatch_and_convert!(env, JNI_CALL_STATIC_DOUBLE_METHOD_A, JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A,
-                    cls, this_obj, clone_mid, jargs_ptr, is_static, f64, |ret: f64| JSValue::float(ret).raw()),
+        b'V' => ffi::qjs_undefined(),
+        b'Z' => JSValue::bool(ret_raw != 0).raw(),
+        b'I' | b'B' | b'C' | b'S' => JSValue::int(ret_raw as i32).raw(),
+        b'J' => ffi::JS_NewBigUint64(ctx, ret_raw),
+        b'F' => JSValue::float(f32::from_bits(ret_raw as u32) as f64).raw(),
+        b'D' => JSValue::float(f64::from_bits(ret_raw)).raw(),
         b'L' | b'[' => {
-            let ret: *mut std::ffi::c_void = dispatch_call!(env, JNI_CALL_STATIC_OBJECT_METHOD_A, JNI_CALL_NONVIRTUAL_OBJECT_METHOD_A,
-                                                            cls, this_obj, clone_mid, jargs_ptr, is_static, *mut std::ffi::c_void);
-            jni_check_exc(env);
-            if ret.is_null() {
+            if ret_raw == 0 {
                 ffi::qjs_null()
             } else {
-                let js_val = ffi::JS_NewBigUint64(ctx, ret as u64);
-                // 释放 JNI local ref，避免 local ref table 泄漏
-                let delete_local_ref: DeleteLocalRefFn =
-                    jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
-                delete_local_ref(env, ret);
-                js_val
+                // Convert to readable JS value (String → JS string, objects → wrapped)
+                // using the same logic as arg marshalling.
+                marshal_jni_arg_to_js(ctx, env, ret_raw, 0, Some(&return_type_sig))
             }
         }
         _ => ffi::qjs_undefined(),
@@ -476,23 +665,39 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     // user_data is ArtMethod* address (used as registry key)
     let art_method_addr = user_data as u64;
 
-    // Copy callback data then release lock before QuickJS operations
-    let (ctx_usize, callback_bytes, is_static, param_count, return_type, param_types) = {
+    // Copy callback data then release lock before QuickJS operations.
+    // Also extract clone info for fallback callOriginal when JS engine is busy.
+    let (ctx_usize, callback_bytes, is_static, param_count, return_type, return_type_sig,
+         param_types, clone_addr, class_global_ref) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
-            Err(_) => return,
+            Err(_) => {
+                // Lock poisoned during cleanup — zero x0 to prevent returning garbage
+                (*ctx_ptr).x[0] = 0;
+                return;
+            }
         };
         let registry = match guard.as_ref() {
             Some(r) => r,
-            None => return,
+            None => {
+                // Registry taken during cleanup — zero x0 to prevent returning JNIEnv* as object
+                (*ctx_ptr).x[0] = 0;
+                return;
+            }
         };
         let hook_data = match registry.get(&art_method_addr) {
             Some(d) => d,
-            None => return,
+            None => {
+                // Hook data removed during cleanup — zero x0
+                (*ctx_ptr).x[0] = 0;
+                return;
+            }
         };
         (hook_data.ctx, hook_data.callback_bytes, hook_data.is_static,
          hook_data.param_count, hook_data.return_type,
-         hook_data.param_types.clone())
+         hook_data.return_type_sig.clone(),
+         hook_data.param_types.clone(),
+         hook_data.clone_addr, hook_data.class_global_ref)
     }; // lock released
 
     // Set callback state globals for js_call_original
@@ -508,6 +713,9 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     } else {
         false
     };
+
+    // Track whether handle_result was called (false if JS exception occurred)
+    let mut result_was_set = false;
 
     invoke_hook_callback_common(
         ctx_usize,
@@ -557,6 +765,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         },
         // 处理返回值：根据 return_type 将 JS 返回值写入 HookContext.x[0]
         |ctx, _js_ctx, result| {
+            result_was_set = true;
             if return_type != b'V' {
                 let result_val = JSValue(result);
                 let ret_u64 = match return_type {
@@ -574,6 +783,17 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                             0u64
                         }
                     }
+                    b'L' | b'[' => {
+                        // Object/array return: marshal JS value back to JNI ref.
+                        // Handles: JS string → NewStringUTF, __jptr wrapper → raw ref,
+                        // BigUint64 → raw ref, null/undefined → 0.
+                        let env: JniEnv = hook_ctx_env;
+                        if !env.is_null() {
+                            marshal_js_to_jvalue(ctx, env, result_val, Some(&return_type_sig))
+                        } else {
+                            result_val.to_u64(ctx).unwrap_or(0)
+                        }
+                    }
                     _ => {
                         if let Some(v) = result_val.to_u64(ctx) {
                             v
@@ -589,10 +809,43 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         },
     );
 
-    // Pop local frame to release JNI local refs created during callback
+    // Fallback: if JS callback was skipped (engine busy) or threw an exception,
+    // handle_result was NOT called. x[0] still contains JNIEnv* (the entry value).
+    // For non-void methods, ART's GenericJniMethodEnd would interpret JNIEnv* as a
+    // return value — for L/[ types, DecodeJObject(JNIEnv*) crashes.
+    // Fix: call original method via JNI to get a valid return value.
+    if !result_was_set && return_type != b'V' {
+        let hook_ctx = &*ctx_ptr;
+        let env: JniEnv = hook_ctx.x[0] as JniEnv;
+        if !env.is_null() && clone_addr != 0 {
+            let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
+            let jargs_ptr = if param_count > 0 {
+                jargs.as_ptr() as *const std::ffi::c_void
+            } else {
+                std::ptr::null()
+            };
+            (*ctx_ptr).x[0] = invoke_clone_jni(
+                env, art_method_addr, clone_addr, class_global_ref,
+                hook_ctx.x[1], return_type, is_static, jargs_ptr,
+            );
+        } else {
+            (*ctx_ptr).x[0] = 0;
+        }
+    }
+
+    // Always PopLocalFrame to keep IRT segments balanced.
+    // For object returns (L/[): PopLocalFrame(env, ret_obj) transfers the local ref
+    // to the outer frame (ART's JNI transition frame) so GenericJniMethodEnd can find it.
+    // For other types: PopLocalFrame(env, null) just cleans up.
     if has_local_frame && !hook_ctx_env.is_null() {
         let pop_frame: PopLocalFrameFn = jni_fn!(hook_ctx_env, PopLocalFrameFn, JNI_POP_LOCAL_FRAME);
-        pop_frame(hook_ctx_env, std::ptr::null_mut());
+        if return_type == b'L' || return_type == b'[' {
+            let ret_obj = (*ctx_ptr).x[0] as *mut std::ffi::c_void;
+            let preserved = pop_frame(hook_ctx_env, ret_obj);
+            (*ctx_ptr).x[0] = preserved as u64;
+        } else {
+            pop_frame(hook_ctx_env, std::ptr::null_mut());
+        }
     }
 
     // Clear callback state globals

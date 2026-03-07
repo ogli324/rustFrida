@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixListener;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::injection::{inject_to_process, inject_debug, DebugInjectMode};
@@ -286,8 +286,8 @@ pub(crate) fn spawn_and_inject(
         }
     };
 
-    // 6. 恢复子进程
-    resume_child(hello.pid)?;
+    // 6. 不立即恢复子进程 — 由 main.rs 在脚本加载完成后调用 resume_child
+    //    子进程主线程仍阻塞在 zymbiote recv(ACK)，agent 线程可独立工作
 
     Ok((pid, host_fd))
 }
@@ -721,7 +721,7 @@ static ACTIVE_CONNECTIONS: OnceLock<Mutex<HashMap<u32, (std::os::unix::net::Unix
 /// 恢复子进程：发 ACK → 等子进程关闭 socket → 等 SIGSTOP → 还原 patch → SIGCONT
 /// 与 Frida 一致的流程：先等 EOF 确保子进程已通过 recv(ACK) 并关闭连接，
 /// 再 wait_until_stopped 等待 raise(SIGSTOP) 完成。
-fn resume_child(pid: u32) -> Result<(), String> {
+pub(crate) fn resume_child(pid: u32) -> Result<(), String> {
     log_step!("正在恢复子进程 {}...", pid);
 
     // 1. 发送 ACK 到子进程
@@ -1689,21 +1689,26 @@ static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
 
 /// 信号是否已收到（信号处理函数只设标记，不做清理，避免死锁）
 static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
+/// 信号计数器：第一次设标记，第二次 _exit 强制退出
+static SIGNAL_COUNT: AtomicI32 = AtomicI32::new(0);
 
 /// 检查是否收到了终止信号
 pub(crate) fn signal_received() -> bool {
     SIGNAL_RECEIVED.load(Ordering::Relaxed)
 }
 
-/// 信号处理函数：仅设置标记 + 恢复默认处理（async-signal-safe）
+/// 信号处理函数：仅设置标记（async-signal-safe）。
 /// 不调用 cleanup_zygote_patches（会获取 Mutex 导致死锁），
 /// 清理由 main 退出路径中的 cleanup_zygote_patches() 完成。
-/// 第二次 Ctrl+C 走 SIG_DFL 立即终止。
-extern "C" fn signal_cleanup_handler(sig: libc::c_int) {
-    SIGNAL_RECEIVED.store(true, Ordering::Relaxed);
-    // 恢复默认信号处理（第二次信号立即终止进程）
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
+/// 第一次信号：设标记，保持 handler 不变（不恢复 SIG_DFL）。
+/// 第二次信号：_exit(1) 强制退出（async-signal-safe，不经过 cleanup）。
+extern "C" fn signal_cleanup_handler(_sig: libc::c_int) {
+    let prev = SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if prev == 0 {
+        SIGNAL_RECEIVED.store(true, Ordering::Relaxed);
+    } else {
+        // 第二次信号：强制退出，避免卡死
+        unsafe { libc::_exit(1) };
     }
 }
 

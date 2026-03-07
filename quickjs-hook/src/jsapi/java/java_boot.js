@@ -6,26 +6,42 @@
     var _unhook = Java.unhook;
     var _methods = Java._methods;
     var _getFieldAuto = Java._getFieldAuto;
+    var _beginBatch = Java._beginBatch;
+    var _endBatch = Java._endBatch;
     delete Java.hook;
     delete Java.unhook;
     delete Java._methods;
     delete Java._getFieldAuto;
+    delete Java._beginBatch;
+    delete Java._endBatch;
 
     // Wrap a raw Java object pointer as a Proxy for field access via dot notation.
     // e.g. ctx.thisObj.mTitle reads the mTitle field via JNI reflection.
+    // Primitive fields → JS primitives; Object fields → recursively wrapped Proxy.
     function _wrapJavaObj(ptr, cls) {
-        return new Proxy({__jptr: ptr, __jclass: cls}, {
+        var target = {__jptr: ptr, __jclass: cls};
+        var handler = {
             get: function(target, prop) {
                 if (prop === "__jptr") return target.__jptr;
                 if (prop === "__jclass") return target.__jclass;
+                if (prop === Symbol.toPrimitive) return function(hint) {
+                    return "[JavaObject:" + target.__jclass + "@" + target.__jptr + "]";
+                };
                 if (typeof prop !== "string") return undefined;
-                if (prop === "toString") return function() {
+                if (prop === "toString" || prop === "valueOf") return function() {
                     return "[JavaObject:" + target.__jclass + "]";
                 };
-                if (prop === "valueOf") return function() {
-                    return "[JavaObject:" + target.__jclass + "]";
-                };
-                var result = _getFieldAuto(target.__jptr, target.__jclass, prop);
+                if (prop === "$className") return target.__jclass;
+                var jptr = target.__jptr;
+                var jcls = target.__jclass;
+                try {
+                    var result = _getFieldAuto(jptr, jcls, prop);
+                } catch(e) {
+                    console.log("[_wrapJavaObj] _getFieldAuto ERROR: " + e
+                        + " ptr=" + jptr + " cls=" + jcls
+                        + " prop=" + prop);
+                    return undefined;
+                }
                 // Object fields come back as {__jptr, __jclass} — wrap recursively
                 if (result !== null && typeof result === "object"
                     && result.__jptr !== undefined) {
@@ -33,7 +49,8 @@
                 }
                 return result;
             }
-        });
+        };
+        return new Proxy(target, handler);
     }
 
     function MethodWrapper(cls, method, sig, cache) {
@@ -152,9 +169,11 @@
             }
 
             if (fn === null || fn === undefined) {
+                if (sigs.length > 1) _beginBatch();
                 for (var i = 0; i < sigs.length; i++) {
                     _unhook(cls, name, sigs[i]);
                 }
+                if (sigs.length > 1) _endBatch();
                 this._fn = null;
             } else {
                 var userFn = fn;
@@ -171,6 +190,16 @@
                             }
                         }
                     }
+                    // Wrap callOriginal so returned objects auto-convert to JS Proxy
+                    var origCallOriginal = ctx.callOriginal;
+                    ctx.callOriginal = function() {
+                        var ret = origCallOriginal.apply(null, arguments);
+                        if (ret !== null && typeof ret === "object"
+                            && ret.__jptr !== undefined) {
+                            return _wrapJavaObj(ret.__jptr, ret.__jclass);
+                        }
+                        return ret;
+                    };
                     return userFn(ctx);
                 };
                 for (var i = 0; i < sigs.length; i++) {
@@ -207,5 +236,64 @@
                 return {enumerable: true, configurable: true};
             }
         });
+    };
+
+    // ========================================================================
+    // Java.ready(fn) — 延迟到 app dex 加载后执行
+    //
+    // spawn 模式下脚本在 setArgV0 阶段加载，此时 app ClassLoader 还未创建，
+    // FindClass 只能找到 framework 类。Java.ready() 通过 hook 框架类
+    // Instrumentation.newApplication (ClassLoader 作为第一个参数传入) 来检测
+    // dex 加载完成，在 Application.attachBaseContext 之前触发用户回调。
+    //
+    // 非 spawn 模式（attach 已运行的进程）时 ClassLoader 已就绪，立即执行。
+    // ========================================================================
+    var _readyCallbacks = [];
+    var _readyFired = false;
+    var _readyGateSig = "(Ljava/lang/ClassLoader;Ljava/lang/String;Landroid/content/Context;)Landroid/app/Application;";
+
+    Java.ready = function(fn) {
+        if (typeof fn !== "function") {
+            throw new Error("Java.ready() requires a function argument");
+        }
+
+        // ClassLoader 已就绪（非 spawn / 已触发过），立即执行
+        if (_readyFired || Java._isClassLoaderReady()) {
+            _readyFired = true;
+            fn();
+            return;
+        }
+
+        // 首个注册：安装 gate hook
+        if (_readyCallbacks.length === 0) {
+            _hook("android/app/Instrumentation", "newApplication", _readyGateSig, function(ctx) {
+                // 从第一个参数获取 ClassLoader 并更新缓存
+                if (ctx.args && ctx.args[0] !== null && ctx.args[0] !== undefined) {
+                    var clPtr = ctx.args[0];
+                    if (typeof clPtr === "object" && clPtr.__jptr !== undefined) {
+                        clPtr = clPtr.__jptr;
+                    }
+                    Java._updateClassLoader(clPtr);
+                }
+
+                // 执行所有排队的回调 — 用户可在此安装 hook
+                // 注意：用户可能重新 hook newApplication，所以先保存 callOriginal 引用
+                _readyFired = true;
+                var cbs = _readyCallbacks;
+                _readyCallbacks = [];
+                for (var i = 0; i < cbs.length; i++) {
+                    try {
+                        cbs[i]();
+                    } catch(e) {
+                        console.log("[Java.ready] callback #" + i + " error: " + e);
+                    }
+                }
+
+                // 调用原始方法 — app 继续 (attachBaseContext, onCreate 等)
+                return ctx.callOriginal();
+            });
+        }
+
+        _readyCallbacks.push(fn);
     };
 })();

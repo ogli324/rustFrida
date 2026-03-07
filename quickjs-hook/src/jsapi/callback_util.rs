@@ -246,15 +246,18 @@ pub(crate) unsafe fn invoke_hook_callback_common(
         None => return,
     };
 
-    // 从 bytes 提取 JS callback value（不增加引用计数，由 registry 管理生命周期）
+    // 从 bytes 提取 JS callback value，dup 增加引用计数。
+    // 回调执行期间 re-hook 可能替换并释放 registry 中的旧回调，
+    // dup 确保 JS_Call 期间函数不会被释放（防止 UAF）。
     let callback: ffi::JSValue =
         std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
+    let callback_dup = ffi::qjs_dup_value(ctx, callback);
 
     // 构建 JS 上下文对象（hook 类型相关）
     let js_ctx = build_context(ctx);
 
     let global = ffi::JS_GetGlobalObject(ctx);
-    let result = ffi::JS_Call(ctx, callback, global, 1, &js_ctx as *const _ as *mut _);
+    let result = ffi::JS_Call(ctx, callback_dup, global, 1, &js_ctx as *const _ as *mut _);
 
     // 异常检查 — 无异常时才处理返回值
     if !handle_js_exception(ctx, result, context_name) {
@@ -265,4 +268,5 @@ pub(crate) unsafe fn invoke_hook_callback_common(
     ffi::qjs_free_value(ctx, js_ctx);
     ffi::qjs_free_value(ctx, result);
     ffi::qjs_free_value(ctx, global);
+    ffi::qjs_free_value(ctx, callback_dup);
 }

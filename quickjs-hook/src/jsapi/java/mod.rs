@@ -154,6 +154,75 @@ unsafe extern "C" fn js_java_get_stealth(
     JSValue::bool(is_stealth_enabled()).raw()
 }
 
+/// JS CFunction: Java._beginBatch() — 进入 batch 模式，defer wxshadow release
+unsafe extern "C" fn js_begin_batch(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    hook_ffi::hook_begin_batch();
+    ffi::qjs_undefined()
+}
+
+/// JS CFunction: Java._endBatch() — 结束 batch，统一 release + re-patch
+unsafe extern "C" fn js_end_batch(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    hook_ffi::hook_end_batch();
+    ffi::qjs_undefined()
+}
+
+/// JS CFunction: Java._updateClassLoader(ptr) — 更新缓存的 app ClassLoader
+/// 由 Java.ready() gate hook 在 Instrumentation.newApplication 回调中调用，
+/// 传入 ClassLoader 的 jobject 指针。
+unsafe extern "C" fn js_update_classloader(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Java._updateClassLoader() requires 1 argument: ClassLoader jobject ptr\0".as_ptr() as *const _,
+        );
+    }
+    let arg = JSValue(*argv);
+    let cl_ptr = match arg.to_u64(ctx) {
+        Some(v) => v as *mut std::ffi::c_void,
+        None => return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Java._updateClassLoader() argument must be a pointer (BigInt)\0".as_ptr() as *const _,
+        ),
+    };
+
+    match ensure_jni_initialized() {
+        Ok(env) => {
+            update_app_classloader(env, cl_ptr);
+            output_message("[java.ready] ClassLoader 已更新");
+            JSValue::bool(true).raw()
+        }
+        Err(_) => {
+            output_message("[java.ready] 获取 JNIEnv 失败，ClassLoader 更新失败");
+            JSValue::bool(false).raw()
+        }
+    }
+}
+
+/// JS CFunction: Java._isClassLoaderReady() — 检查 app ClassLoader 是否已就绪
+unsafe extern "C" fn js_is_classloader_ready(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    JSValue::bool(is_classloader_ready()).raw()
+}
+
 /// Register Java API: hook/unhook (C-level) + _methods, then eval boot script
 /// to set up the Proxy-based Java.use() API.
 pub fn register_java_api(ctx: &JSContext) {
@@ -187,6 +256,10 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
         add_cfunction_to_object(ctx_ptr, java_obj, "_setForcedInterpretOnly", js_java_set_forced_interpret_only, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "_initArtController", js_java_init_art_controller, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_beginBatch", js_begin_batch, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_endBatch", js_end_batch, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_updateClassLoader", js_update_classloader, 1);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_isClassLoaderReady", js_is_classloader_ready, 0);
 
         // Set Java object on global
         global.set_property(ctx.as_ptr(), "Java", JSValue(java_obj));
@@ -213,6 +286,67 @@ pub fn register_java_api(ctx: &JSContext) {
 /// - WouldBlock: 当前线程已持有锁（正常路径），JS callback 释放安全
 /// - Ok: 意外的非锁定路径调用，获取锁后释放 JS callback
 pub fn cleanup_java_hooks() {
+    // 【关键】先清空 C 侧 ART router 查表，切断路由 → 防止并发线程通过
+    // Layer 1 router 访问即将释放的 replacement ArtMethod (UAF)
+    unsafe {
+        hook_ffi::hook_art_router_table_clear();
+    }
+
+    // ============================================================
+    // Pass 1: 恢复所有 ArtMethod 字段 + 删除 replacedMethods 映射
+    //
+    // 【必须在移除 Layer 1 hooks 之前完成】
+    // 否则: Layer 1 hook 移除后原始 trampoline 恢复，但 ArtMethod 仍然是
+    // native+data_=our_thunk → 其他线程调用 → jni_trampoline → 我们的 thunk
+    // → callback 找不到 registry → 返回 x0=JNIEnv* 作为返回值 → 崩溃
+    // ============================================================
+    {
+        let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(registry) = guard.as_ref() {
+            for (_art_method, data) in registry.iter() {
+                unsafe {
+                    // 恢复 ArtMethod 字段 (flags, data_, entry_point)
+                    if let Some(spec) = ART_METHOD_SPEC.get() {
+                        let ep_offset = spec.entry_point_offset;
+                        let data_off = spec.data_offset;
+
+                        std::ptr::write_volatile(
+                            (data.art_method as usize + spec.access_flags_offset) as *mut u32,
+                            data.original_access_flags,
+                        );
+                        std::ptr::write_volatile(
+                            (data.art_method as usize + data_off) as *mut u64,
+                            data.original_data,
+                        );
+                        std::ptr::write_volatile(
+                            (data.art_method as usize + ep_offset) as *mut u64,
+                            data.original_entry_point,
+                        );
+                        hook_ffi::hook_flush_cache(
+                            (data.art_method as usize) as *mut std::ffi::c_void,
+                            ep_offset + 8,
+                        );
+                    }
+
+                    // 删除 replacedMethods 映射
+                    callback::delete_replacement_method(data.art_method);
+                }
+            }
+        }
+    } // guard dropped — 释放锁让 in-flight callback 能获取锁并安全退出
+
+    // 短暂等待让 in-flight thunk 回调完成
+    // ArtMethod 已恢复 → 不会有新线程进入 thunk，只需等待已在 thunk 中的线程退出
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // 移除 artController 全局 hook (Layer 1/2/GC)
+    // 此时 ArtMethod 已全部恢复，移除 Layer 1 hook 后不会有线程进入 thunk
+    art_controller::cleanup_art_controller();
+
+    // ============================================================
+    // Pass 2: 移除 per-method hooks + 释放资源
+    // ============================================================
+
     // Get JNIEnv for global ref cleanup (best effort)
     let env_opt = unsafe { get_thread_env().ok() };
 
@@ -225,7 +359,6 @@ pub fn cleanup_java_hooks() {
     if let Some(registry) = guard.take() {
         for (_art_method, data) in registry {
             unsafe {
-                // 统一 Replaced 清理
                 match &data.hook_type {
                     callback::HookType::Replaced { replacement_addr, per_method_hook_target } => {
                         // 移除 per-method 路由 hook (Layer 3, if any)
@@ -235,30 +368,6 @@ pub fn cleanup_java_hooks() {
 
                         // 移除 native trampoline
                         hook_ffi::hook_remove_redirect(data.art_method);
-
-                        // 恢复全部 ArtMethod 字段
-                        if let Some(spec) = ART_METHOD_SPEC.get() {
-                            let ep_offset = spec.entry_point_offset;
-                            let data_off = spec.data_offset;
-
-                            let flags_ptr = (data.art_method as usize + spec.access_flags_offset)
-                                as *mut u32;
-                            std::ptr::write_volatile(flags_ptr, data.original_access_flags);
-
-                            let data_ptr = (data.art_method as usize + data_off) as *mut u64;
-                            std::ptr::write_volatile(data_ptr, data.original_data);
-
-                            let ep_ptr = (data.art_method as usize + ep_offset) as *mut u64;
-                            std::ptr::write_volatile(ep_ptr, data.original_entry_point);
-
-                            hook_ffi::hook_flush_cache(
-                                (data.art_method as usize) as *mut std::ffi::c_void,
-                                ep_offset + 8,
-                            );
-                        }
-
-                        // 删除 replacedMethods 映射
-                        callback::delete_replacement_method(data.art_method);
 
                         // 释放 replacement ArtMethod (malloc 分配)
                         if *replacement_addr != 0 {
@@ -288,13 +397,5 @@ pub fn cleanup_java_hooks() {
                 ffi::qjs_free_value(ctx, callback);
             }
         }
-    }
-
-    // 清理 artController 全局 hook
-    art_controller::cleanup_art_controller();
-
-    // 清空 C 侧 ART router 内联查表
-    unsafe {
-        hook_ffi::hook_art_router_table_clear();
     }
 }

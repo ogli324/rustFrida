@@ -389,11 +389,13 @@ pub(super) unsafe extern "C" fn js_java_hook(
     // ================================================================
     let per_method_hook_target = if has_independent_code {
         // --- 编译方法: Layer 3 inline hook ---
+        let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
         let trampoline = hook_ffi::hook_install_art_router(
             original_entry_point as *mut std::ffi::c_void,
             ep_offset as u32,
             stealth_flag(),
             env as *mut std::ffi::c_void,
+            &mut hooked_target,
         );
 
         if trampoline.is_null() {
@@ -426,12 +428,18 @@ pub(super) unsafe extern "C" fn js_java_hook(
             8,
         );
 
+        // 使用实际被 hook 的地址 (可能经过 resolve_art_trampoline 解析)
+        let actual_hook_target = if !hooked_target.is_null() {
+            hooked_target as u64
+        } else {
+            original_entry_point
+        };
         output_message(&format!(
-            "[java hook] Step 9: Layer 3 installed: ep={:#x}, trampoline={:#x}",
-            original_entry_point, trampoline as u64
+            "[java hook] Step 9: Layer 3 installed: ep={:#x} (hooked={:#x}), trampoline={:#x}",
+            original_entry_point, actual_hook_target, trampoline as u64
         ));
 
-        Some(original_entry_point)
+        Some(actual_hook_target)
     } else {
         // --- 共享 stub 方法: Frida 风格 nterp 降级 ---
         // Nterp 特判: nterp → interpreter_bridge (libart → libart，无非 ART 地址暴露)
@@ -482,6 +490,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
                 clone_addr,
                 class_global_ref,
                 return_type,
+                return_type_sig: get_return_type_sig(&actual_sig),
                 ctx: ctx as usize,
                 callback_bytes,
                 method_key: method_key(&class_name, &method_name, &actual_sig),

@@ -875,7 +875,7 @@ pub(super) unsafe fn cache_fields_for_class(
     // Enumerate fields using JNI reflection (safe from init thread)
     let fields = match enumerate_class_fields(env, class_name) {
         Ok(f) => f,
-        Err(_) => return,
+        Err(_e) => return,
     };
 
     // Resolve field IDs and store in cache
@@ -1027,14 +1027,36 @@ unsafe fn enumerate_class_fields(
         }
     };
 
-    // getDeclaredFields() — own fields (including private, static)
-    if !get_declared_fields_mid.is_null() {
-        let arr = call_obj(env, cls, get_declared_fields_mid, std::ptr::null());
-        if jni_check_exc(env) { /* skip */ }
-        else { extract_fields(arr); }
+    // Walk the entire class hierarchy: getDeclaredFields() on each class
+    // to capture protected/private inherited fields (e.g. mBase in ContextWrapper).
+    {
+        let c_get_superclass = CString::new("getSuperclass").unwrap();
+        let c_get_superclass_sig = CString::new("()Ljava/lang/Class;").unwrap();
+        let get_superclass_mid = get_mid(
+            env, class_cls,
+            c_get_superclass.as_ptr(), c_get_superclass_sig.as_ptr(),
+        );
+
+        let mut current_cls = cls;
+        loop {
+            if current_cls.is_null() { break; }
+
+            // getDeclaredFields() on current class
+            if !get_declared_fields_mid.is_null() {
+                let arr = call_obj(env, current_cls, get_declared_fields_mid, std::ptr::null());
+                if jni_check_exc(env) { /* skip */ }
+                else { extract_fields(arr); }
+            }
+
+            // Walk to superclass
+            if get_superclass_mid.is_null() { break; }
+            let super_cls = call_obj(env, current_cls, get_superclass_mid, std::ptr::null());
+            if jni_check_exc(env) || super_cls.is_null() { break; }
+            current_cls = super_cls;
+        }
     }
 
-    // getFields() — all public inherited fields (including static)
+    // getFields() — all public inherited fields (catches interface constants, etc.)
     if !get_fields_mid.is_null() {
         let arr = call_obj(env, cls, get_fields_mid, std::ptr::null());
         if jni_check_exc(env) { /* skip */ }

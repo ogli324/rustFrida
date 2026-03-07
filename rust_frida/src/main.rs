@@ -167,6 +167,12 @@ fn main() {
             + std::time::Duration::from_secs(args.connect_timeout);
         log_info!("等待 agent 连接... (最长 {}s)", args.connect_timeout);
         while !AGENT_STAT.load(Ordering::Acquire) {
+            // Spawn 模式：Ctrl+C 触发清理退出（100ms 轮询间隔内响应）
+            if args.spawn.is_some() && spawn::signal_received() {
+                log_info!("收到终止信号，正在清理...");
+                spawn::cleanup_zygote_patches();
+                std::process::exit(1);
+            }
             if std::time::Instant::now() >= deadline {
                 log_error!(
                     "等待 agent 连接超时 ({}s)，请检查:",
@@ -184,12 +190,25 @@ fn main() {
                 log_warn!("  2. logcat | grep -E 'FATAL|crash'  （agent 崩溃？）");
                 log_warn!("  3. 使用 --verbose 重新运行查看详细注入日志");
                 log_warn!("  4. adb logcat | grep rustFrida  （查看 agent 日志）");
+                // Spawn 模式：超时前恢复子进程，防止永远卡在 recv(ACK)
+                if let Some(pid) = target_pid {
+                    if args.spawn.is_some() {
+                        let _ = spawn::resume_child(pid as u32);
+                    }
+                }
                 std::process::exit(1);
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
     let sender = GLOBAL_SENDER.get().unwrap();
+
+    // Spawn 模式下需要延迟恢复的子进程 PID
+    let spawn_pid: Option<u32> = if args.spawn.is_some() {
+        target_pid.map(|p| p as u32)
+    } else {
+        None
+    };
 
     // Fix #2 & #7: --load-script 用 eval_state 等待 jsinit/loadjs 确认，而非 sleep(1)
     if let Some(script_path) = &args.load_script {
@@ -224,6 +243,19 @@ fn main() {
             Err(e) => {
                 log_error!("读取脚本文件 '{}' 失败: {}", script_path, e);
             }
+        }
+    }
+
+    // Spawn 模式：脚本加载完成后（或无脚本时）恢复子进程
+    // 延迟 resume 确保 hook 在第一个生命周期回调之前生效
+    if let Some(pid) = spawn_pid {
+        if spawn::signal_received() {
+            log_info!("收到终止信号，正在清理...");
+            spawn::cleanup_zygote_patches();
+            std::process::exit(1);
+        }
+        if let Err(e) = spawn::resume_child(pid) {
+            log_error!("恢复子进程失败: {}", e);
         }
     }
 
@@ -329,7 +361,15 @@ fn main() {
     }
 
     // 等待 handler 线程退出（agent 关闭 socket 后 host 收到 EOF 自然退出）
-    let _ = handle.join();
+    // 超时保护: agent cleanup 可能因 wxshadow prctl / JNI 调用 / 锁竞争而阻塞
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let _ = handle.join();
+        let _ = done_tx.send(());
+    });
+    if done_rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+        log_warn!("等待 agent 退出超时 (5s)，强制退出");
+    }
 }
 
 /// Debug 模式：监控目标进程存活状态

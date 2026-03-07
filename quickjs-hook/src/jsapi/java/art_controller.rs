@@ -209,19 +209,27 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
                 output_message(&format!("[artController] Layer 1: {} 地址为0，跳过", name));
                 continue;
             }
+            let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
             let trampoline = unsafe {
                 hook_ffi::hook_install_art_router(
                     *addr as *mut std::ffi::c_void,
                     ep_offset as u32,
                     stealth_flag(),
                     env,
+                    &mut hooked_target,
                 )
             };
             if !trampoline.is_null() {
-                shared_stub_targets.push(*addr);
+                // 使用实际被 hook 的地址 (可能经过 resolve_art_trampoline 解析)
+                let actual_target = if !hooked_target.is_null() {
+                    hooked_target as u64
+                } else {
+                    *addr
+                };
+                shared_stub_targets.push(actual_target);
                 output_message(&format!(
-                    "[artController] Layer 1: {} hook 安装成功: {:#x}, trampoline={:#x}",
-                    name, addr, trampoline as u64
+                    "[artController] Layer 1: {} hook 安装成功: {:#x} (hooked={:#x}), trampoline={:#x}",
+                    name, addr, actual_target, trampoline as u64
                 ));
             } else {
                 output_message(&format!(
@@ -758,61 +766,31 @@ pub(super) fn cleanup_art_controller() {
 
     output_message("[artController] 开始清理全局 ART hook...");
 
-    // 移除 Layer 1: 共享 stub 路由 hooks
+    // 收集所有需要移除的地址，统一移除
+    let mut all_targets: Vec<(&str, u64)> = Vec::new();
     for &addr in &state.shared_stub_targets {
-        unsafe {
-            hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
-        }
-        output_message(&format!("[artController] Layer 1 hook 已移除: {:#x}", addr));
+        all_targets.push(("Layer1", addr));
     }
-
-    // 移除 Layer 2: DoCall hooks
     for &addr in &state.do_call_targets {
-        unsafe {
-            hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
-        }
-        output_message(&format!("[artController] Layer 2 DoCall hook 已移除: {:#x}", addr));
+        all_targets.push(("Layer2", addr));
     }
-
-    // 移除 GC 同步 hooks
     for &addr in &state.gc_hook_targets {
-        unsafe {
-            hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
-        }
-        output_message(&format!("[artController] GC hook 已移除: {:#x}", addr));
+        all_targets.push(("GC", addr));
     }
-
-    // 移除 GetOatQuickMethodHeader hook
     if state.oat_header_hook_target != 0 {
-        unsafe {
-            hook_ffi::hook_remove(state.oat_header_hook_target as *mut std::ffi::c_void);
-        }
-        output_message(&format!(
-            "[artController] GetOatQuickMethodHeader hook 已移除: {:#x}",
-            state.oat_header_hook_target
-        ));
+        all_targets.push(("OatHeader", state.oat_header_hook_target));
     }
-
-    // 移除 FixupStaticTrampolines hook
     if state.fixup_hook_target != 0 {
-        unsafe {
-            hook_ffi::hook_remove(state.fixup_hook_target as *mut std::ffi::c_void);
-        }
-        output_message(&format!(
-            "[artController] FixupStaticTrampolines hook 已移除: {:#x}",
-            state.fixup_hook_target
-        ));
+        all_targets.push(("Fixup", state.fixup_hook_target));
+    }
+    if state.pretty_method_hook_target != 0 {
+        all_targets.push(("PrettyMethod", state.pretty_method_hook_target));
     }
 
-    // 移除 PrettyMethod hook
-    if state.pretty_method_hook_target != 0 {
+    for (_label, addr) in &all_targets {
         unsafe {
-            hook_ffi::hook_remove(state.pretty_method_hook_target as *mut std::ffi::c_void);
+            hook_ffi::hook_remove(*addr as *mut std::ffi::c_void);
         }
-        output_message(&format!(
-            "[artController] PrettyMethod hook 已移除: {:#x}",
-            state.pretty_method_hook_target
-        ));
     }
 
     output_message("[artController] 全局 ART hook 清理完成");

@@ -66,11 +66,13 @@ void restore_page_rx(uintptr_t page_start);
 HookEntry* alloc_entry(void);
 void free_entry(HookEntry* entry);
 int wxshadow_patch(void* addr, const void* buf, size_t len);
-int wxshadow_release(void* addr);
+int wxshadow_release(void* addr, size_t len);
+int wxshadow_release_all(void);
 int write_jump_back(void* dst, void* target, uint32_t written_regs);
 
 /* --- Core (hook_engine.c) --- */
 HookEntry* find_hook(void* target);
+void batch_add_dirty_page(uintptr_t page);
 
 /* --- Hook installation helpers (hook_engine_mem.c) --- */
 
