@@ -32,11 +32,13 @@ fn compute_classlinker_candidates(java_vm_off: usize) -> Vec<usize> {
 // ============================================================================
 
 /// ArtField 结构体字段偏移规格
+#[allow(dead_code)]
 pub(super) struct ArtFieldSpec {
     pub size: usize,
     pub access_flags_offset: usize,
 }
 
+#[allow(dead_code)]
 static ART_FIELD_SPEC: OnceLock<Option<ArtFieldSpec>> = OnceLock::new();
 
 /// 获取 ArtField 布局规格（按 API level 硬编码，对标 Frida getArtFieldSpec）
@@ -44,6 +46,7 @@ static ART_FIELD_SPEC: OnceLock<Option<ArtFieldSpec>> = OnceLock::new();
 /// API >= 23 (Android 6+): size=16, access_flags_offset=4
 /// API 21-22 (Android 5.x): size=24, access_flags_offset=12
 /// API < 21: 不支持
+#[allow(dead_code)]
 pub(super) fn get_art_field_spec() -> Option<&'static ArtFieldSpec> {
     ART_FIELD_SPEC
         .get_or_init(|| {

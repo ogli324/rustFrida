@@ -6,6 +6,7 @@
  */
 
 #include "quickjs.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* JS_FreeValue wrapper */
@@ -269,4 +270,3 @@ void qjs_update_stack_top(JSContext *ctx) {
     JSRuntime *rt = JS_GetRuntime(ctx);
     JS_UpdateStackTop(rt);
 }
-

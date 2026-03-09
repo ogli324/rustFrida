@@ -4,6 +4,8 @@
 //! managed_stack_、self_、top_handle_scope_ 等字段偏移。
 //! 兼容 Android 5.x (API 22) 到最新版本的布局变化。
 
+#![allow(dead_code)]
+
 use std::sync::OnceLock;
 
 use super::jni_core::get_android_api_level;

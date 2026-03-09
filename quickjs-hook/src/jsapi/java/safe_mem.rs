@@ -52,6 +52,7 @@ pub(super) unsafe fn safe_read_u32(addr: u64) -> u32 {
 }
 
 /// 安全读取 u16，地址无效时返回 0
+#[allow(dead_code)]
 pub(super) unsafe fn safe_read_u16(addr: u64) -> u16 {
     if !is_readable(addr, 2) {
         return 0;

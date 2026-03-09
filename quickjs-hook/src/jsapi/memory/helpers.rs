@@ -54,6 +54,7 @@ fn get_page_prot(addr: u64) -> Option<i32> {
 /// Check whether the page containing `addr` is writable by parsing /proc/self/maps.
 /// Returns `true` if writable (or if the map cannot be read — assume writable to avoid
 /// breaking writes to legitimate RW pages).
+#[allow(dead_code)]
 pub(super) fn is_page_writable(addr: u64) -> bool {
     match get_page_prot(addr) {
         Some(prot) => (prot & libc::PROT_WRITE) != 0,

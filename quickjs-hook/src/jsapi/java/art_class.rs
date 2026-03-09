@@ -4,6 +4,8 @@
 //! 然后扫描 mirror::Class 对象内存定位 ifields_、sfields_、methods_ 和
 //! copied_methods_offset_ 偏移。
 
+#![allow(dead_code)]
+
 use std::sync::OnceLock;
 
 use super::art_method::get_art_field_spec;

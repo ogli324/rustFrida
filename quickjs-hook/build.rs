@@ -43,6 +43,7 @@ fn main() {
             .flag("-DCONFIG_VERSION=\"2024-01-13\"")
             .flag("-DCONFIG_BIGNUM")
             .flag("-D_GNU_SOURCE")
+            .flag_if_supported("-Wno-implicit-const-int-float-conversion")
             .warnings(false);
 
         // Android-specific flags

@@ -40,6 +40,7 @@ pub(super) struct JavaHookData {
     // Per-parameter JNI type descriptors (e.g. ["I", "Ljava/lang/String;", "[B"])
     pub(super) param_types: Vec<String>,
     // Hooked class name (dot notation, for wrapping object args)
+    #[allow(dead_code)]
     pub(super) class_name: String,
 }
 

@@ -133,6 +133,7 @@ pub(super) unsafe fn decode_method_id(
     )
 }
 
+#[allow(dead_code)]
 pub(super) unsafe fn decode_field_id(
     env: JniEnv,
     cls: *mut std::ffi::c_void,
@@ -163,14 +164,18 @@ pub(super) unsafe fn decode_field_id(
 /// then used from hook callback threads without calling FindClass.
 pub(super) struct ReflectIds {
     /// Class.getField(String) → Field
+    #[allow(dead_code)]
     pub(super) get_field_mid: *mut std::ffi::c_void,
     /// Class.getDeclaredField(String) → Field
+    #[allow(dead_code)]
     pub(super) get_declared_field_mid: *mut std::ffi::c_void,
     /// Field.getType() → Class
+    #[allow(dead_code)]
     pub(super) field_get_type_mid: *mut std::ffi::c_void,
     /// Class.getName() → String
     pub(super) class_get_name_mid: *mut std::ffi::c_void,
     /// Global ref to java.lang.String class (for IsInstanceOf checks in callbacks)
+    #[allow(dead_code)]
     pub(super) string_class: *mut std::ffi::c_void,
     /// Global ref to java.util.List for automatic List/ArrayList marshaling
     pub(super) list_class: *mut std::ffi::c_void,
@@ -207,6 +212,7 @@ pub(super) struct ReflectIds {
     /// Field ID for java.lang.reflect.Executable.artMethod (long) — used to decode encoded jmethodIDs
     pub(super) art_method_field_id: *mut std::ffi::c_void,
     /// Field ID for java.lang.reflect.Field.artField (long) — used to decode encoded jfieldIDs
+    #[allow(dead_code)]
     pub(super) art_field_field_id: *mut std::ffi::c_void,
 }
 

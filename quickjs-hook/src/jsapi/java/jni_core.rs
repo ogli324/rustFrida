@@ -193,6 +193,7 @@ pub(super) type ToReflectedMethodFn = unsafe extern "C" fn(
     *mut std::ffi::c_void,
     u8,
 ) -> *mut std::ffi::c_void;
+#[allow(dead_code)]
 pub(super) type ToReflectedFieldFn = unsafe extern "C" fn(
     JniEnv,
     *mut std::ffi::c_void,
@@ -627,6 +628,7 @@ fn probe_with_known_method_legacy(env: JniEnv) -> Option<usize> {
 
 pub(super) const JNI_FIND_CLASS: usize = 6;
 pub(super) const JNI_TO_REFLECTED_METHOD: usize = 9;
+#[allow(dead_code)]
 pub(super) const JNI_TO_REFLECTED_FIELD: usize = 12;
 pub(super) const JNI_EXCEPTION_CLEAR: usize = 17;
 pub(super) const JNI_PUSH_LOCAL_FRAME: usize = 19;
@@ -889,6 +891,7 @@ struct JniIdDecoderState {
     /// JniIdManager::DecodeMethodId 函数指针 (可能为 null)
     decode_method_id_fn: Option<DecodeIdFn>,
     /// JniIdManager::DecodeFieldId 函数指针 (可能为 null)
+    #[allow(dead_code)]
     decode_field_id_fn: Option<DecodeIdFn>,
     /// JniIdManager* 指针 (作为 DecodeMethodId/DecodeFieldId 的 this)
     jni_id_manager: u64,
@@ -1078,6 +1081,7 @@ pub(super) unsafe fn decode_method_id_via_manager(method_id: u64) -> Option<u64>
 }
 
 /// 通过 JniIdManager::DecodeFieldId 解码 jfieldID → ArtField*
+#[allow(dead_code)]
 pub(super) unsafe fn decode_field_id_via_manager(field_id: u64) -> Option<u64> {
     decode_id_via_manager(field_id, |s| s.decode_field_id_fn)
 }

@@ -3,6 +3,7 @@
 // ============================================================================
 
 /// Instrumentation 偏移规格
+#[allow(dead_code)]
 pub(super) struct InstrumentationSpec {
     /// Runtime.instrumentation_ 在 Runtime 结构体中的偏移
     pub runtime_instrumentation_offset: usize,

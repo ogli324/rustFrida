@@ -86,7 +86,7 @@ pub fn create_native_pointer(ctx: *mut ffi::JSContext, addr: u64) -> JSValue {
 }
 
 /// Get address from NativePointer object
-pub fn get_native_pointer_addr(ctx: *mut ffi::JSContext, val: JSValue) -> Option<u64> {
+pub fn get_native_pointer_addr(_ctx: *mut ffi::JSContext, val: JSValue) -> Option<u64> {
     let class_id = NATIVE_POINTER_CLASS_ID.load(Ordering::Relaxed);
     if class_id == 0 {
         return None;

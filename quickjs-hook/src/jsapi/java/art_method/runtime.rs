@@ -39,6 +39,7 @@ pub(super) unsafe fn find_runtime_java_vm() -> Option<(u64, usize)> {
 // ============================================================================
 
 /// ART Runtime 内部关键偏移
+#[allow(dead_code)]
 pub(super) struct ArtRuntimeSpec {
     /// Heap* 偏移
     pub heap_offset: usize,
