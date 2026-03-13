@@ -2,6 +2,7 @@ use crate::state::{
     clear_last_error, decode_args, decode_memory_access_type, set_last_error, with_vm, ManagedVm,
     NEXT_VM_HANDLE, VM_REGISTRY,
 };
+use crate::writer::flush_thread_local_chunk;
 use qbdi::{simulate_call, GPRState, VirtualStack};
 use std::ffi::{c_char, CStr};
 use std::sync::atomic::Ordering;
@@ -247,7 +248,11 @@ pub extern "C" fn qbdi_vm_simulate_call(
 #[no_mangle]
 pub extern "C" fn qbdi_vm_run(handle: u64, start: u64, stop: u64) -> i32 {
     clear_last_error();
-    match with_vm(handle, |managed| Ok(managed.vm.run(start, stop))) {
+    match with_vm(handle, |managed| {
+        let ok = managed.vm.run(start, stop);
+        flush_thread_local_chunk();
+        Ok(ok)
+    }) {
         Ok(true) => 0,
         Ok(false) => {
             set_last_error(format!("qbdi run({:#x}, {:#x}) failed", start, stop));

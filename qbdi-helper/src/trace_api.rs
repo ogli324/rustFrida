@@ -5,12 +5,15 @@ use crate::data::{
 use crate::state::{
     clear_last_error, helper_log, set_last_error, set_trace_output_dir, ExecMap,
     ADDED_DYNAMIC_RANGES, DUMPED_DYNAMIC_RANGES, TRACE_EXECUTED_INSTRUCTIONS,
-    DYNAMIC_EXEC_CHUNK_SIZE, TRACE_MAX_INSTRUCTIONS, TRACE_PROGRESS_EVERY, TRACE_STACK_SIZE,
+    DYNAMIC_EXEC_CHUNK_SIZE, TRACE_PROGRESS_EVERY, TRACE_STACK_SIZE,
 };
-use crate::writer::{finalize_trace_session_async, shutdown_trace_writer, start_trace_writer, trace_send};
+use crate::writer::{
+    finalize_trace_session_async, flush_thread_local_chunk, shutdown_trace_writer,
+    start_trace_writer, trace_send,
+};
 use qbdi::ffi::{
     qbdi_addInstrumentedRange, InstPosition_QBDI_PREINST, MemoryAccessType_QBDI_MEMORY_READ,
-    VMAction_QBDI_CONTINUE, VMAction_QBDI_STOP, VMEvent_QBDI_EXEC_TRANSFER_CALL,
+    VMAction_QBDI_CONTINUE, VMEvent_QBDI_EXEC_TRANSFER_CALL,
     VMEvent_QBDI_EXEC_TRANSFER_RETURN, VMInstanceRef,
 };
 use qbdi::{simulate_call, FPRState, GPRState, VMAction, VMRef, VM, VirtualStack};
@@ -36,14 +39,6 @@ extern "C" fn qbdicb(
                     "[qbdi-helper] trace progress: instructions={} pc={:#x}",
                     count, (*gpr_state).pc
                 ));
-            }
-            if count >= TRACE_MAX_INSTRUCTIONS {
-                helper_log(&format!(
-                    "[qbdi-helper] trace stopped at instruction cap {} (pc={:#x})",
-                    TRACE_MAX_INSTRUCTIONS,
-                    (*gpr_state).pc
-                ));
-                return VMAction_QBDI_STOP;
             }
         }
     }
@@ -408,6 +403,7 @@ fn run_hook_trace_impl(args: &[u64], target: u64) -> Result<u64, String> {
     if !vm.run(target, 0) {
         return Err(format!("QBDI vm.run({:#x}) failed", target));
     }
+    flush_thread_local_chunk();
     vm.gpr_state()
         .map(|gpr| gpr.x0)
         .ok_or_else(|| "QBDI GPRState missing after run".to_string())

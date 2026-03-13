@@ -10,7 +10,6 @@ use std::thread::JoinHandle;
 pub(crate) const TRACE_BUNDLE_MAGIC: &[u8; 4] = b"TRB1";
 pub(crate) const DYNAMIC_EXEC_CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TRACE_MAX_PENDING_BYTES: usize = 1024 * 1024 * 1024;
-pub(crate) const TRACE_MAX_INSTRUCTIONS: u64 = 5_000;
 pub(crate) const TRACE_PROGRESS_EVERY: u64 = 1_000;
 pub(crate) const TRACE_CHUNK_SIZE: usize = 1024 * 1024;
 pub(crate) const TRACE_SHARDS: usize = 4;
