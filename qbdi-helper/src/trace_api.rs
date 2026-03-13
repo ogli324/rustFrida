@@ -328,6 +328,7 @@ fn setup_simulated_call_context(vm: &VM, args: &[u64]) -> Result<VirtualStack, S
 fn snapshot_trace_context(vm: &VM, target: u64) -> Result<TraceContext, String> {
     let gpr = vm.gpr_state().ok_or_else(|| "QBDI GPRState is null".to_string())?;
     let fpr = vm.fpr_state();
+    let tpidr_el0 = read_tpidr_el0();
 
     let x = vec![
         gpr.x0, gpr.x1, gpr.x2, gpr.x3, gpr.x4, gpr.x5, gpr.x6, gpr.x7, gpr.x8, gpr.x9, gpr.x10,
@@ -351,11 +352,25 @@ fn snapshot_trace_context(vm: &VM, target: u64) -> Result<TraceContext, String> 
         sp: gpr.sp,
         pc: target,
         nzcv: gpr.nzcv,
-        tpidr_el0: 0,
+        tpidr_el0,
         q,
         fpcr: fpr.fpcr,
         fpsr: fpr.fpsr,
     })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn read_tpidr_el0() -> u64 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!("mrs {value}, tpidr_el0", value = out(reg) value);
+    }
+    value
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn read_tpidr_el0() -> u64 {
+    0
 }
 
 fn run_hook_trace_impl(args: &[u64], target: u64) -> Result<u64, String> {
