@@ -174,8 +174,10 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
 
             js_ctx
         },
-        // 处理返回值：从上下文对象读回 x0（replace mode 只恢复 x0）
-        |ctx, js_ctx, result| {
+        // 处理返回值：replace mode 只恢复 x0
+        // - 显式 return 值 → 用该值
+        // - 不 return（undefined）→ x0 = 0；想用原返回值请写 return ctx.orig()
+        |ctx, _js_ctx, result| {
             result_was_set = true;
             let result_val = ffi::JSValue {
                 u: result.u,
@@ -184,7 +186,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             if ffi::qjs_is_undefined(result_val) == 0 {
                 (*ctx_ptr).x[0] = js_value_to_u64_or_zero(ctx, crate::value::JSValue(result_val));
             } else {
-                (*ctx_ptr).x[0] = get_js_u64_property(ctx, js_ctx, "x0");
+                (*ctx_ptr).x[0] = 0;
             }
         },
     );

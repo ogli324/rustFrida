@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use libc::{c_void, close, write as libc_write};
+use libc::{c_void, close, read as libc_read, write as libc_write};
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
@@ -128,6 +128,10 @@ impl InjectionGuard {
             host_fd,
             disarmed: false,
         }
+    }
+
+    fn as_fd(&self) -> RawFd {
+        self.host_fd
     }
 
     /// 注入成功，取走 host_fd，不再自动清理
@@ -295,11 +299,30 @@ pub(crate) fn inject_to_process(
                     -11 => "loader 写入 memfd 失败",
                     _ => "未知错误",
                 };
+                // -5/-6/-7: shellcode 在返回前把 dlerror/错误消息写入了 ctrl_fd，
+                // 等 sender 线程结束后从 host_fd 读取该消息
+                let remote_msg = if matches!(ret, -5 | -6 | -7) {
+                    let _ = sender.join();
+                    let fd = guard.as_fd();
+                    let mut buf = [0u8; 1024];
+                    let n = unsafe { libc_read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+                    if n > 0 {
+                        String::from_utf8_lossy(&buf[..n as usize]).to_string()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
                 let _ = call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None);
                 let _ = ptrace::detach(Pid::from_raw(pid), None);
                 let fd = guard.into_fd();
                 unsafe { close(fd) };
-                return Err(format!("Shellcode 执行失败 ({}): {}", ret, reason));
+                if remote_msg.is_empty() {
+                    return Err(format!("Shellcode 执行失败 ({}): {}", ret, reason));
+                } else {
+                    return Err(format!("Shellcode 执行失败 ({}): {} -> {}", ret, reason, remote_msg));
+                }
             }
 
             match sender.join() {
