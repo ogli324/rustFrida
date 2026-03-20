@@ -15,6 +15,23 @@ pub(crate) struct UserRegs {
     pub(crate) pstate: u64,     // 处理器状态
 }
 
+/// ARM64 FP/SIMD 寄存器结构体 (NT_FPREGSET / NT_PRFPREG)
+/// 对应 Linux struct user_fpsimd_state (asm/ptrace.h)
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct UserFpRegs {
+    pub(crate) vregs: [u128; 32], // V0-V31 (128-bit SIMD 寄存器)
+    pub(crate) fpsr: u32,         // 浮点状态寄存器
+    pub(crate) fpcr: u32,         // 浮点控制寄存器
+}
+
+impl Default for UserFpRegs {
+    fn default() -> Self {
+        // 不能用 derive(Default) 因为 [u128; 32] 没有 Default
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 // =============================================================================
 // Frida-style 注入框架结构体
 // ABI 关键：必须与 loader/helpers/ 中的 C 结构体布局完全一致

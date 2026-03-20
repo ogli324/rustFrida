@@ -398,7 +398,17 @@ int recompile_page(
         uint64_t orig_ret_addr = orig_pc + 4;  /* BL 用：LR 指向原始地址 */
 
         /* 生成跳板代码 */
+        size_t tramp_before = arm64_writer_offset(&tw);
         emit_trampoline(&tw, &info, insn, return_addr, orig_ret_addr);
+        size_t tramp_after = arm64_writer_offset(&tw);
+
+        /* 安全检查：跳板必须有内容 */
+        if (tramp_after == tramp_before) {
+            local_stats.error = -1;
+            snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
+                     "空跳板 (offset=0x%x, type=%d)", i * 4, info.type);
+            goto done;
+        }
 
         /* BL 也用 B（LR 由跳板手动设置为原始地址） */
         uint32_t branch_insn;
@@ -421,6 +431,22 @@ int recompile_page(
         local_stats.error = -1;
         snprintf(local_stats.error_msg, sizeof(local_stats.error_msg),
                  "跳板区 label 解析失败");
+    }
+
+    /* DEBUG: dump offset 0xfbc-0xfdc 的原始 vs recomp 指令（含页基址） */
+    if (local_stats.error == 0) {
+        for (int d = 0xfbc/4; d <= 0xfdc/4 && d < RECOMP_INSN_COUNT; d++) {
+            uint32_t orig = orig_insns[d];
+            uint32_t recomp = recomp_insns[d];
+            hook_log("[recomp-dump] page=%llx offset=0x%03x: orig=%08x recomp=%08x %s",
+                     (unsigned long long)orig_base, d*4, orig, recomp,
+                     orig != recomp ? "CHANGED" : "same");
+        }
+    }
+
+    /* 在跳板区末尾填 BRK guard，防止 fall-through 到空白执行垃圾指令 */
+    while (arm64_writer_can_write(&tw, 4)) {
+        arm64_writer_put_brk_imm(&tw, 0xFEED);
     }
 
 done:

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process;
 
 use crate::{log_info, log_success, log_warn};
-use crate::types::UserRegs;
+use crate::types::{UserRegs, UserFpRegs};
 
 /// 获取指定库的基址
 ///
@@ -122,6 +122,27 @@ pub(crate) fn attach_to_process(pid: i32) -> Result<(), String> {
 }
 
 /// 获取进程寄存器（pub 接口供 code-swap 使用）
+/// 轮询 /proc/pid/status 等待进程进入 stopped 状态
+pub(crate) fn wait_process_stopped(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(data) = std::fs::read(format!("/proc/{}/status", pid)) {
+            let status = String::from_utf8_lossy(&data);
+            for line in status.lines() {
+                if line.starts_with("State:") && line.contains("stopped") {
+                    return true;
+                }
+            }
+        } else {
+            return false; // 进程不存在
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 pub(crate) fn get_registers_pub(pid: i32) -> Result<UserRegs, String> {
     get_registers(pid)
 }
@@ -163,6 +184,44 @@ fn set_registers(pid: i32, regs: &UserRegs) -> Result<(), String> {
     Ok(())
 }
 
+/// 获取 FP/SIMD 寄存器 (NT_FPREGSET = 2)
+fn get_fp_registers(pid: i32) -> Result<UserFpRegs, String> {
+    let mut regs = UserFpRegs::default();
+    let mut iov = iovec {
+        iov_base: &mut regs as *mut _ as *mut c_void,
+        iov_len: size_of_val(&regs),
+    };
+    let result = unsafe {
+        libc::ptrace(
+            PTRACE_GETREGSET,
+            pid as pid_t,
+            2, // NT_FPREGSET
+            &mut iov as *mut _ as *mut c_void,
+        )
+    };
+    if result == -1 {
+        let errno = unsafe { *libc::__errno() };
+        return Err(format!("获取 FP 寄存器失败，错误码: {}", errno));
+    }
+    Ok(regs)
+}
+
+/// 设置 FP/SIMD 寄存器 (NT_FPREGSET = 2)
+fn set_fp_registers(pid: i32, regs: &UserFpRegs) -> Result<(), String> {
+    let mut iov = iovec {
+        iov_base: regs as *const _ as *mut c_void,
+        iov_len: size_of_val(regs),
+    };
+    let result = unsafe {
+        libc::ptrace(PTRACE_SETREGSET, pid as pid_t, 2, &mut iov as *mut _ as *mut c_void)
+    };
+    if result == -1 {
+        let errno = unsafe { *libc::__errno() };
+        return Err(format!("设置 FP 寄存器失败，错误码: {}", errno));
+    }
+    Ok(())
+}
+
 /// 调用目标进程的 libc 函数
 ///
 /// # 参数
@@ -179,8 +238,9 @@ pub(crate) fn call_target_function(
     args: &[usize],
     debug: Option<bool>,
 ) -> Result<usize, String> {
-    // 获取当前寄存器状态
+    // 获取当前寄存器状态（GP + FP/SIMD）
     let orig_regs = get_registers(pid)?;
+    let orig_fp_regs = get_fp_registers(pid).ok(); // FP 保存失败不阻塞
 
     // 设置新的寄存器状态
     let mut new_regs = orig_regs;
@@ -258,8 +318,23 @@ pub(crate) fn call_target_function(
                     // 函数执行完成，获取返回值（ARM64 使用 X0 寄存器返回值）
                     let return_value = regs.regs[0] as usize;
 
-                    // 恢复原始寄存器状态
+                    // 恢复原始寄存器状态（GP + FP/SIMD）
                     set_registers(pid, &orig_regs)?;
+                    if let Some(ref fp) = orig_fp_regs {
+                        let _ = set_fp_registers(pid, fp);
+                    }
+
+                    // 验证恢复后的寄存器
+                    let verify = get_registers(pid)?;
+                    if verify.pc != orig_regs.pc || verify.sp != orig_regs.sp || verify.regs[29] != orig_regs.regs[29] {
+                        log_warn!(
+                            "寄存器恢复验证: PC={:#x}→{:#x} SP={:#x}→{:#x} FP={:#x}→{:#x} LR={:#x}→{:#x}",
+                            orig_regs.pc, verify.pc,
+                            orig_regs.sp, verify.sp,
+                            orig_regs.regs[29], verify.regs[29],
+                            orig_regs.regs[30], verify.regs[30]
+                        );
+                    }
 
                     return Ok(return_value);
                 } else {

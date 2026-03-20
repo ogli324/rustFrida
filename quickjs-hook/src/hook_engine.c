@@ -45,6 +45,7 @@ int hook_engine_init(void* exec_mem, size_t size) {
     g_engine.exec_mem = exec_mem;
     g_engine.exec_mem_size = size;
     g_engine.exec_mem_used = 0;
+    g_engine.pool_count = 0;
     g_engine.hooks = NULL;
     g_engine.free_list = NULL;
     g_engine.redirects = NULL;

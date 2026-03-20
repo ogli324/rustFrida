@@ -13,6 +13,7 @@ fn main() {
         .file(src_path.join("hook_engine_inline.c"))
         .file(src_path.join("hook_engine_redir.c"))
         .file(src_path.join("hook_engine_art.c"))
+        .file(src_path.join("hook_engine_oat_patch.c"))
         .file(src_path.join("arm64_writer.c"))
         .file(src_path.join("arm64_relocator.c"))
         .file(src_path.join("recomp/recomp_page.c"))
@@ -143,6 +144,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/hook_engine_inline.c");
     println!("cargo:rerun-if-changed=src/hook_engine_redir.c");
     println!("cargo:rerun-if-changed=src/hook_engine_art.c");
+    println!("cargo:rerun-if-changed=src/hook_engine_oat_patch.c");
     println!("cargo:rerun-if-changed=src/arm64_writer.c");
     println!("cargo:rerun-if-changed=src/arm64_writer.h");
     println!("cargo:rerun-if-changed=src/arm64_relocator.c");

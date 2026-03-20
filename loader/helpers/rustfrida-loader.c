@@ -90,6 +90,7 @@ static bool frida_send_error (int sockfd, FridaMessageType type, const char * me
 
 static bool frida_receive_chunk (int sockfd, void * buffer, size_t length, const FridaLibcApi * api);
 static int frida_receive_fd (int sockfd, const FridaLibcApi * libc);
+static int frida_receive_fd_diag (int sockfd, const FridaLibcApi * libc, char * diag_buf);
 static bool frida_send_chunk (int sockfd, const void * buffer, size_t length, const FridaLibcApi * libc);
 static void frida_enable_close_on_exec (int fd, const FridaLibcApi * libc);
 
@@ -156,9 +157,13 @@ frida_main (void * user_data)
     char agent_path[32];
     const void * pretend_caller_addr = libc->close;
 
-    agent_codefd = frida_receive_fd (ctrlfd, libc);
+    agent_codefd = frida_receive_fd_diag (ctrlfd, libc, agent_path /* reuse as diag buf */);
     if (agent_codefd == -1)
+    {
+      frida_send_error (ctrlfd, FRIDA_MESSAGE_ERROR_DLOPEN,
+          agent_path /* contains diag msg */, libc);
       goto beach;
+    }
 
     libc->sprintf (agent_path, "/proc/self/fd/%d", agent_codefd);
 
@@ -181,9 +186,17 @@ frida_main (void * user_data)
 
   /* Signal READY and wait for ACK before entering agent */
   if (!frida_send_ready (ctrlfd, libc))
+  {
+    frida_send_error (ctrlfd, FRIDA_MESSAGE_ERROR_DLOPEN,
+        "frida_send_ready failed", libc);
     goto beach;
+  }
   if (!frida_receive_ack (ctrlfd, libc))
+  {
+    frida_send_error (ctrlfd, FRIDA_MESSAGE_ERROR_DLOPEN,
+        "frida_receive_ack failed", libc);
     goto beach;
+  }
 
   /* Construct AgentArgs on stack and call hello_entry */
   {
@@ -384,6 +397,36 @@ frida_receive_chunk (int sockfd, void * buffer, size_t length, const FridaLibcAp
   }
 
   return true;
+}
+
+static int
+frida_receive_fd_diag (int sockfd, const FridaLibcApi * libc, char * diag_buf)
+{
+  int res;
+  uint8_t dummy;
+  struct iovec io = {
+    .iov_base = &dummy,
+    .iov_len = sizeof (dummy)
+  };
+  FridaControlMessage control;
+  struct msghdr msg;
+
+  msg.msg_name = NULL,
+  msg.msg_namelen = 0,
+  msg.msg_iov = &io,
+  msg.msg_iovlen = 1,
+  msg.msg_control = &control,
+  msg.msg_controllen = sizeof (control),
+
+  res = libc->recvmsg (sockfd, &msg, 0);
+  if (res == -1 || res == 0 || msg.msg_controllen == 0)
+  {
+    libc->sprintf (diag_buf, "recvfd:res=%d,ctl=%d,fd=%d",
+        res, (int) msg.msg_controllen, sockfd);
+    return -1;
+  }
+
+  return *((int *) CMSG_DATA (CMSG_FIRSTHDR (&msg)));
 }
 
 static int

@@ -301,7 +301,8 @@ int write_jump_back(void* dst, void* target, uint32_t written_regs) {
     return finalize_jump_writer(&w);
 }
 
-/* Write an absolute jump using arm64_writer (MOVZ/MOVK + BR sequence) */
+/* Write a jump to target. 优先 ADRP+ADD+BR (12B, wxshadow 安全, 需 ±4GB),
+ * fallback 到 MOVZ+MOVK+BR (16B, 无限制)。对标 Frida 的近距离优先策略。 */
 int hook_write_jump(void* dst, void* target) {
     if (!dst || !target) {
         return HOOK_ERROR_INVALID_PARAM;
@@ -309,31 +310,124 @@ int hook_write_jump(void* dst, void* target) {
 
     Arm64Writer w;
     arm64_writer_init(&w, dst, (uint64_t)dst, MIN_HOOK_SIZE);
-    arm64_writer_put_branch_address(&w, (uint64_t)target);
 
-    /* Check if branch_address exceeded our buffer */
+    /* 尝试 ADRP+ADD+BR (12 字节, ±4GB) */
+    int64_t pc_rel = (int64_t)(uint64_t)target - (int64_t)(uint64_t)dst;
+    int64_t adrp_range = (int64_t)1 << 32; /* ±4GB */
+    if (pc_rel > -adrp_range && pc_rel < adrp_range) {
+        arm64_writer_put_adrp_add_br(&w, ARM64_REG_X16, (uint64_t)target);
+    } else {
+        /* Fallback: MOVZ+MOVK+BR (16+ 字节) */
+        arm64_writer_put_branch_address(&w, (uint64_t)target);
+    }
+
     if (arm64_writer_offset(&w) > MIN_HOOK_SIZE) {
         arm64_writer_clear(&w);
         return HOOK_ERROR_BUFFER_TOO_SMALL;
     }
 
-    return finalize_jump_writer(&w);
+    /* 不 pad BRK — 返回实际字节数 (ADRP=12, MOVZ=16)。
+     * 调用方（patch_target/OAT）按返回值决定 overwrite 大小。 */
+    int bytes_written = (int)arm64_writer_offset(&w);
+    arm64_writer_clear(&w);
+    return bytes_written;
 }
 
 /* Allocate from executable memory pool */
-void* hook_alloc(size_t size) {
-    if (!g_engine.initialized) return NULL;
+/* 从指定 pool 分配 */
+static void* alloc_from_pool(ExecPool* pool, size_t size) {
+    if (pool->used + size > pool->size) return NULL;
+    void* ptr = (uint8_t*)pool->base + pool->used;
+    pool->used += size;
+    return ptr;
+}
 
-    /* Align to 8 bytes */
-    size = (size + 7) & ~7;
-
-    if (g_engine.exec_mem_used + size > g_engine.exec_mem_size) {
+/* 创建新 pool（mmap near hint）。
+ * 如果 mmap 结果不在 hint 的 ADRP 范围内，仍保留 pool（供通用分配用）。 */
+static ExecPool* create_pool_near(void* hint) {
+    if (g_engine.pool_count >= MAX_EXEC_POOLS) {
+        return NULL;  /* 静默失败，调用方会 fallback 到 hook_alloc */
+    }
+    void* ptr = mmap(hint, EXEC_POOL_SIZE,
+                     PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
         return NULL;
     }
+    ExecPool* pool = &g_engine.pools[g_engine.pool_count++];
+    pool->base = ptr;
+    pool->size = EXEC_POOL_SIZE;
+    pool->used = 0;
+    return pool;
+}
 
-    void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
-    g_engine.exec_mem_used += size;
-    return ptr;
+/* 判断 pool 是否在 target 的 ADRP 范围内 (±4GB) */
+static int pool_in_adrp_range(ExecPool* pool, void* target) {
+    int64_t dist = (int64_t)((uint8_t*)pool->base - (uint8_t*)target);
+    int64_t range = (int64_t)1 << 32;
+    return dist > -range && dist < range;
+}
+
+void* hook_alloc(size_t size) {
+    if (!g_engine.initialized) return NULL;
+    size = (size + 7) & ~7;
+
+    /* 先试初始 pool */
+    if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
+        void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+        g_engine.exec_mem_used += size;
+        return ptr;
+    }
+
+    /* 试其他 pool */
+    for (int i = 0; i < g_engine.pool_count; i++) {
+        void* ptr = alloc_from_pool(&g_engine.pools[i], size);
+        if (ptr) return ptr;
+    }
+
+    /* 创建新 pool（无 hint） */
+    ExecPool* pool = create_pool_near(NULL);
+    return pool ? alloc_from_pool(pool, size) : NULL;
+}
+
+void* hook_alloc_near(size_t size, void* target) {
+    if (!g_engine.initialized) return NULL;
+    size = (size + 7) & ~7;
+
+    int64_t adrp_range = (int64_t)1 << 32;
+
+    /* 1. 遍历所有 pool（含初始 pool），找 ADRP 可达 + 有空间的 */
+    if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
+        int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
+        if (dist > -adrp_range && dist < adrp_range) {
+            void* ptr = (uint8_t*)g_engine.exec_mem + g_engine.exec_mem_used;
+            g_engine.exec_mem_used += size;
+            return ptr;
+        }
+    }
+    for (int i = 0; i < g_engine.pool_count; i++) {
+        if (pool_in_adrp_range(&g_engine.pools[i], target)) {
+            void* ptr = alloc_from_pool(&g_engine.pools[i], size);
+            if (ptr) return ptr;
+        }
+    }
+
+    /* 2. 没有 ADRP 可达的 pool → 尝试创建一个靠近 target 的。
+     *    但只在没有通用空间时才创建（避免浪费）。 */
+    void* fallback = hook_alloc(size);
+    if (fallback) {
+        /* 有通用空间可用，检查是否碰巧在 ADRP 范围内 */
+        int64_t dist = (int64_t)((uint8_t*)fallback - (uint8_t*)target);
+        if (dist > -adrp_range && dist < adrp_range) {
+            return fallback; /* 运气好，在 ADRP 范围 */
+        }
+        /* 不在 ADRP 范围，但 hook_write_jump 会用 MOVZ+MOVK 兜底 */
+        return fallback;
+    }
+
+    /* 3. 通用分配也失败 → 创建新 pool */
+    ExecPool* new_pool = create_pool_near(target);
+    return new_pool ? alloc_from_pool(new_pool, size) : NULL;
 }
 
 /* --- Instruction relocation --- */
@@ -421,9 +515,9 @@ HookEntry* setup_hook_entry(void* target) {
 
     entry->target = target;
 
-    /* Allocate trampoline space (reuse if available and large enough) */
+    /* Allocate trampoline space near target (for ADRP range) */
     if (!entry->trampoline || entry->trampoline_alloc < TRAMPOLINE_ALLOC_SIZE) {
-        entry->trampoline = hook_alloc(TRAMPOLINE_ALLOC_SIZE);
+        entry->trampoline = hook_alloc_near(TRAMPOLINE_ALLOC_SIZE, target);
         entry->trampoline_alloc = TRAMPOLINE_ALLOC_SIZE;
     }
     if (!entry->trampoline) {
@@ -443,14 +537,16 @@ HookEntry* setup_hook_entry(void* target) {
 }
 
 int build_trampoline(HookEntry* entry) {
-    /* Relocate original instructions to trampoline */
+    /* Relocate original instructions to trampoline.
+     * 用 original_size（= 实际 patch 大小，ADRP=12 或 MOVZ=16），不用 MIN_HOOK_SIZE。 */
     uint32_t written_regs = 0;
+    size_t overwrite = entry->original_size;
     size_t relocated_size = hook_relocate_instructions(
         entry->original_bytes, (uint64_t)entry->target,
-        entry->trampoline, MIN_HOOK_SIZE, &written_regs);
+        entry->trampoline, overwrite, &written_regs);
 
     /* Write jump back to original code after the relocated instructions */
-    void* jump_back_target = (uint8_t*)entry->target + MIN_HOOK_SIZE;
+    void* jump_back_target = (uint8_t*)entry->target + overwrite;
     int jump_result = write_jump_back(
         (uint8_t*)entry->trampoline + relocated_size,
         jump_back_target, written_regs);
@@ -461,10 +557,32 @@ int build_trampoline(HookEntry* entry) {
 int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     int jump_result;
 
-    if (stealth) {
-        /* Stealth mode: wxshadow one-step PATCH.
-         * Kernel creates shadow page, copies buf, activates (--x) in one prctl.
-         * If wxshadow fails, fall through to mprotect. */
+    if (stealth == 2) {
+        /* Recomp 模式: 写 4 字节 B 指令到 recomp 页。
+         * recomp 内核模块只改原始页 PTE，不碰 recomp 页，mprotect 安全。 */
+        int64_t b_offset = (int64_t)(uintptr_t)jump_dest - (int64_t)(uintptr_t)target;
+        if (b_offset < -(1 << 27) || b_offset >= (1 << 27)) {
+            hook_log("patch_target: B range exceeded for recomp (offset=%lld)", (long long)b_offset);
+            return HOOK_ERROR_BUFFER_TOO_SMALL;
+        }
+        uint32_t b_imm26 = ((uint32_t)(b_offset >> 2)) & 0x3FFFFFF;
+        uint32_t b_insn = 0x14000000 | b_imm26;
+
+        uintptr_t page_start = (uintptr_t)target & ~0xFFF;
+        if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            return HOOK_ERROR_MPROTECT_FAILED;
+        }
+        *(volatile uint32_t*)target = b_insn;
+        hook_flush_cache(target, 4);
+        entry->stealth = 2;
+        entry->original_size = 4;
+        restore_page_rx(page_start);
+
+        return 0;
+    }
+
+    if (stealth == 1) {
+        /* wxshadow 模式: 一步写入 shadow 页 */
         uint8_t jump_buf[MIN_HOOK_SIZE];
         jump_result = hook_write_jump(jump_buf, jump_dest);
         if (jump_result < 0) {
@@ -472,12 +590,13 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         }
         if (wxshadow_patch(target, jump_buf, jump_result) == 0) {
             entry->stealth = 1;
+            entry->original_size = jump_result;
             return 0;
         }
         hook_log("patch_target: wxshadow failed, falling back to mprotect");
     }
 
-    /* Normal mode (or wxshadow fallback): mprotect + direct write */
+    /* Normal mode (stealth=0) or wxshadow fallback: mprotect + direct write */
     uintptr_t page_start = (uintptr_t)target & ~0xFFF;
     if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         return HOOK_ERROR_MPROTECT_FAILED;
@@ -488,6 +607,7 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
         return jump_result;
     }
     entry->stealth = 0;
+    entry->original_size = jump_result;
     restore_page_rx(page_start);
 
     return 0;

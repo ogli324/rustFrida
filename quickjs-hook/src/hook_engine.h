@@ -67,11 +67,23 @@ typedef struct HookRedirectEntry {
     struct HookRedirectEntry* next; /* Next entry in list */
 } HookRedirectEntry;
 
+/* 可执行内存 pool（多个，按需靠近 hook 目标分配） */
+#define MAX_EXEC_POOLS 16
+#define EXEC_POOL_SIZE (64 * 1024)  /* 每个 pool 64KB */
+
+typedef struct {
+    void* base;
+    size_t size;
+    size_t used;
+} ExecPool;
+
 /* Global hook engine state */
 typedef struct {
-    void* exec_mem;                 /* Executable memory pool */
-    size_t exec_mem_size;           /* Total pool size */
-    size_t exec_mem_used;           /* Used bytes */
+    void* exec_mem;                 /* 初始 pool（向后兼容） */
+    size_t exec_mem_size;           /* 初始 pool 总大小 */
+    size_t exec_mem_used;           /* 初始 pool 已用 */
+    ExecPool pools[MAX_EXEC_POOLS]; /* 多 pool（含初始 pool） */
+    int pool_count;                 /* 已分配 pool 数 */
     HookEntry* hooks;               /* Linked list of hooks */
     HookEntry* free_list;           /* Freed entries for reuse */
     HookRedirectEntry* redirects;   /* Linked list of redirect hooks */
@@ -140,7 +152,12 @@ void hook_engine_cleanup(void);
  * @param size          Number of bytes to allocate
  * @return              Pointer to allocated memory, NULL on failure
  */
+/* Allocate from any pool (legacy, no locality guarantee) */
 void* hook_alloc(size_t size);
+
+/* Allocate from a pool near `target` (within ±4GB for ADRP).
+ * Creates a new pool via mmap(hint) if no existing pool is in range. */
+void* hook_alloc_near(size_t size, void* target);
 
 /*
  * Relocate ARM64 instruction(s) to dst.
@@ -290,6 +307,11 @@ void hook_dump_code(void* addr, size_t size);
 void hook_art_router_get_debug(uint64_t* last_x0, uint64_t* miss_count);
 
 /*
+ * Get hit counter for found path + last matched X0.
+ */
+void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0);
+
+/*
  * Debug: reset the not_found X0 capture and miss counter.
  */
 void hook_art_router_reset_debug(void);
@@ -350,6 +372,14 @@ void* resolve_art_trampoline(void* target, void* jni_env);
 void* hook_create_art_router_stub(uint64_t fallback_target,
                                    uint32_t quickcode_offset);
 
+/* C-side GC synchronization — 对标 Frida synchronize_replacement_methods.
+ * 遍历 router table 同步 declaring_class_ + nterp 降级。
+ * 由 Rust 侧 GC 回调调用。 */
+void hook_art_synchronize_replacement_methods(
+    uint32_t quickcode_offset,
+    uint64_t nterp_entrypoint,
+    uint64_t interp_bridge);
+
 /*
  * Install a replace-mode hook (save ctx → callback → restore x0 → RET)
  *
@@ -376,6 +406,25 @@ void* hook_replace(void* target, HookCallback on_enter, void* user_data, int ste
  * @return              x0 result from the original function
  */
 uint64_t hook_invoke_trampoline(HookContext* ctx, void* trampoline);
+
+/*
+ * Patch inlined GetOatQuickMethodHeader copies in WalkStack (API 31+).
+ *
+ * Scans libart.so executable segments for the inlined pattern and binary-patches
+ * each copy with a trampoline that checks if the method is a replacement (via
+ * g_art_router_table). Replacement methods skip the OAT lookup to prevent
+ * NULL+0x18 SIGSEGV in WalkStack.
+ *
+ * @return  Number of patterns patched (>=0), or negative error code
+ */
+int hook_patch_inlined_oat_header_checks(void);
+
+/*
+ * Restore all inlined OAT header patches applied by hook_patch_inlined_oat_header_checks().
+ *
+ * @return  Number of patches restored
+ */
+int hook_restore_inlined_oat_header_patches(void);
 
 #ifdef __cplusplus
 }

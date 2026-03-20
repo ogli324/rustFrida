@@ -11,7 +11,7 @@
 static REPLACED_METHODS: BiMap = BiMap::new();
 
 /// 注册 original → replacement 映射（双向 + C 侧内联查表）
-pub(super) fn set_replacement_method(original: u64, replacement: u64) {
+pub(in crate::jsapi::java) fn set_replacement_method(original: u64, replacement: u64) {
     REPLACED_METHODS.init();
     REPLACED_METHODS.insert(original, replacement);
     // 同步到 C 侧内联查表 (thunk 直接扫描，无需 Mutex+HashMap)

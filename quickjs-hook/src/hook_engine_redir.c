@@ -86,7 +86,7 @@ static void* prepare_redirect_entry(uint64_t key, HookRedirectEntry** out_entry)
     }
     memset(entry, 0, sizeof(HookRedirectEntry));
 
-    /* Allocate thunk memory */
+    /* redirect/native thunk 通过指针间接调用，不需要近距离分配 */
     void* thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
     if (!thunk_mem) {
         pthread_mutex_unlock(&g_engine.lock);
@@ -210,6 +210,7 @@ void* hook_create_native_trampoline(uint64_t key, HookCallback on_enter, void* u
     pthread_mutex_lock(&g_engine.lock);
 
     HookRedirectEntry* entry;
+    /* native trampoline 通过 ArtMethod.data_ 间接调用，不需要 ADRP 近距离 */
     void* thunk_mem = prepare_redirect_entry(key, &entry);
     if (!thunk_mem) return NULL;
 

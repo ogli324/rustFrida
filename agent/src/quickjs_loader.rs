@@ -22,6 +22,18 @@ use crate::communication::{log_msg, write_stream};
 static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HOOK_EXEC_VMA_NAME: &[u8] = b"wwb_hook_exec\0";
 
+/// 从 /proc/self/maps 找 libart.so 的 r-xp 基址（用作 mmap hint）
+fn find_libart_base() -> Option<usize> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    for line in maps.lines() {
+        if line.contains("libart.so") && line.contains("r-xp") {
+            let addr = line.split('-').next()?;
+            return usize::from_str_radix(addr, 16).ok();
+        }
+    }
+    None
+}
+
 /// Executable memory for hooks
 static EXEC_MEM: OnceLock<ExecMemory> = OnceLock::new();
 
@@ -32,14 +44,17 @@ struct ExecMemory {
 }
 
 impl ExecMemory {
-    /// Allocate new executable memory
-    fn new(size: usize) -> Option<Self> {
+    /// Allocate executable memory near `hint` address (for ADRP range).
+    /// Falls back to kernel-chosen address if hint fails.
+    fn new_near(size: usize, hint: usize) -> Option<Self> {
         let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
         let alloc_size = ((size + page_size - 1) / page_size) * page_size;
+        // 页对齐 hint
+        let hint_aligned = if hint != 0 { (hint + page_size) & !(page_size - 1) } else { 0 };
 
         unsafe {
             let ptr = mmap(
-                ptr::null_mut(),
+                hint_aligned as *mut _,
                 alloc_size,
                 PROT_READ | PROT_WRITE | PROT_EXEC,
                 MAP_PRIVATE | MAP_ANONYMOUS,
@@ -64,6 +79,10 @@ impl ExecMemory {
                 size: alloc_size,
             })
         }
+    }
+
+    fn new(size: usize) -> Option<Self> {
+        Self::new_near(size, 0)
     }
 
     fn as_ptr(&self) -> *mut u8 {
@@ -93,14 +112,20 @@ pub fn init() -> Result<(), String> {
         return Err("JS 引擎已初始化".to_string());
     }
 
-    // Allocate executable memory for hooks (64KB)
-    let exec_mem = EXEC_MEM.get_or_init(|| ExecMemory::new(64 * 1024).expect("Failed to allocate executable memory"));
+    // Allocate executable memory for hooks (64KB), near libart.so for ADRP range
+    let libart_hint = find_libart_base().unwrap_or(0);
+    let exec_mem = EXEC_MEM.get_or_init(|| {
+        ExecMemory::new_near(64 * 1024, libart_hint)
+            .expect("Failed to allocate executable memory")
+    });
 
     // Initialize hook engine
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
 
-    // 注册 recomp handler，供 JS hook("recomp") 模式使用
+    // 注册 recomp handlers
     quickjs_hook::recomp::set_handler(|addr| crate::recompiler::ensure_and_translate(addr));
+    quickjs_hook::recomp::set_alloc_slot_handler(|addr| crate::recompiler::alloc_trampoline_slot(addr));
+
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
         set_qbdi_output_dir(output_path.clone());

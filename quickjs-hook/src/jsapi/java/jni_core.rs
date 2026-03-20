@@ -389,9 +389,13 @@ unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
     // ARM64 上两者都是 8，但 size 计算不同
     let api_level = get_android_api_level();
     let ep_offset = d_offset + 8;
-    // 对标 Frida: API <= 21 ArtMethod 有额外 GC map/vmap 字段 → +32
-    //            API >= 22 entry_point 是最后一个字段 → +pointerSize(8)
-    let size = if api_level <= 21 { ep_offset + 32 } else { ep_offset + 8 };
+    // size 必须覆盖所有会被读写的字段。
+    // Frida 公式: quickCodeOffset + pointerSize，但 Android 16 (API 36) 的
+    // access_flags 可能在 entry_point 之后 (offset 36 > quickCode+8=32)。
+    // 取所有字段末尾的最大值。
+    let frida_size = if api_level <= 21 { ep_offset + 32 } else { ep_offset + 8 };
+    let access_flags_end = af_offset + 4; // access_flags is u32
+    let size = frida_size.max(access_flags_end);
 
     output_message(&format!(
         "[art spec] Frida-style 探测成功: access_flags={}, data_={}, entry_point={}, size={} (API {})",
@@ -664,17 +668,13 @@ pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
 
     // Slow path: find JavaVM first
     unsafe {
-        // Find JNI_GetCreatedJavaVMs — 直接走 unrestricted API
-        // hide_soinfo 摘除 agent soinfo 后，libc::dlsym/dlopen 会导致 linker
-        // 内部空指针崩溃（caller soinfo 不存在），必须跳过。
         let sym = crate::jsapi::module::libart_dlsym("JNI_GetCreatedJavaVMs");
         if sym.is_null() {
             return Err("dlsym(JNI_GetCreatedJavaVMs) failed".to_string());
         }
 
-        // JNI_GetCreatedJavaVMs(JavaVM** vmBuf, jsize bufLen, jsize* nVMs) -> jint
         let get_vms: unsafe extern "C" fn(
-            *mut *mut std::ffi::c_void, // JavaVM**
+            *mut *mut std::ffi::c_void,
             i32,
             *mut i32,
         ) -> i32 = std::mem::transmute(sym);
@@ -700,17 +700,31 @@ pub(crate) fn ensure_jni_initialized() -> Result<JniEnv, String> {
 /// Attach the current thread to the JavaVM and return its JNIEnv*.
 /// Idempotent — returns existing env if thread is already attached.
 unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv, String> {
+    // 先试 GetEnv — 如果当前线程已 attach，直接返回（不触发 Thread::Attach）
     let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
+    let get_env_fn: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *mut *mut std::ffi::c_void,
+        i32,
+    ) -> i32 = std::mem::transmute(*vm_table.add(6)); // GetEnv = index 6
+
+    let mut env_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let get_env_ret = get_env_fn(vm_ptr, &mut env_ptr, 0x00010006); // JNI_VERSION_1_6
+    if get_env_ret == 0 && !env_ptr.is_null() {
+        return Ok(env_ptr as JniEnv);
+    }
+
+    // GetEnv 失败 → 需要 AttachCurrentThread
     let attach_fn: unsafe extern "C" fn(
         *mut std::ffi::c_void,
         *mut *mut std::ffi::c_void,
         *mut std::ffi::c_void,
     ) -> i32 = std::mem::transmute(*vm_table.add(4));
 
-    let mut env_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    env_ptr = std::ptr::null_mut();
     let ret = attach_fn(vm_ptr, &mut env_ptr, std::ptr::null_mut());
     if ret != 0 || env_ptr.is_null() {
-        return Err("AttachCurrentThread failed".to_string());
+        return Err(format!("AttachCurrentThread failed (ret={})", ret));
     }
 
     Ok(env_ptr as JniEnv)

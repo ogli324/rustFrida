@@ -5,4 +5,4 @@
 
 pub mod page;
 
-pub use page::{ensure_and_translate, set_handler};
+pub use page::{alloc_trampoline_slot, ensure_and_translate, set_alloc_slot_handler, set_handler};

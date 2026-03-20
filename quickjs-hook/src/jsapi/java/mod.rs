@@ -348,6 +348,16 @@ unsafe extern "C" fn js_is_classloader_ready(
     JSValue::bool(is_classloader_ready()).raw()
 }
 
+/// JS CFunction: Java._reprobeClassLoader() — 主动重新探测 ClassLoader
+unsafe extern "C" fn js_reprobe_classloader(
+    _ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    JSValue::bool(reflect::reprobe_classloader()).raw()
+}
+
 unsafe fn js_loader_arg_to_ptr(ctx: *mut ffi::JSContext, arg: JSValue) -> u64 {
     if let Some(v) = arg.to_u64(ctx) {
         return v;
@@ -467,12 +477,52 @@ unsafe extern "C" fn js_java_set_classloader(
     JSValue::bool(set_classloader_override(env, loader_ptr as *mut std::ffi::c_void)).raw()
 }
 
+/// 预初始化 artController Layer 1+2 (在进程暂停时调用)。
+/// spawn 模式下必须在 resume_child 之前调用,确保 inline hooks 在所有
+/// 线程暂停时安装,避免代码覆写与执行的竞态条件。
+pub fn pre_init_art_controller() -> Result<(), String> {
+    let env = ensure_jni_initialized().map_err(|e| format!("JNI init failed: {}", e))?;
+    unsafe {
+        // 探测 ArtMethodSpec (需要一个已知的 native 方法来校准偏移)
+        // 传 0 会使用内部探测逻辑
+        let spec = jni_core::get_art_method_spec(env, 0);
+        let ep_offset = spec.entry_point_offset;
+        // 发现 ART bridge 函数
+        let bridge = art_method::find_art_bridge_functions(env, ep_offset);
+        // 初始化 artController (安装 Layer 1+2 全局 hooks)
+        art_controller::ensure_art_controller_initialized(
+            &bridge,
+            ep_offset,
+            env as *mut std::ffi::c_void,
+        );
+    }
+    Ok(())
+}
+
 /// Register Java API: hook/unhook (C-level) + _methods, then eval boot script
 /// to set up the Proxy-based Java.use() API.
+/// Spawn 模式延迟 JNI 初始化：AttachCurrentThread + cache reflect IDs + 触发 gate hook。
+/// 在 resume 之后调用（ART 已完成 post-fork 初始化）。
+pub fn deferred_java_init() -> Result<(), String> {
+    let env = ensure_jni_initialized()
+        .map_err(|e| format!("deferred_java_init: {}", e))?;
+    unsafe { cache_reflect_ids(env); }
+
+    crate::jsapi::console::output_message("[java] deferred_java_init: JNI 已就绪");
+
+    // 触发 Java.ready gate hook 安装：调用 Java._installGateHook()
+    // loadjs 在 resume 前运行时 Java.ready(fn) 注册了回调但 gate hook 安装失败（无 JNI）
+    // 现在 JNI 就绪，重新安装 gate hook
+    if let Err(e) = crate::load_script("Java._installGateHook && Java._installGateHook()") {
+        crate::jsapi::console::output_message(&format!("[java] gate hook eval 失败: {}", e));
+    }
+
+    Ok(())
+}
+
 pub fn register_java_api(ctx: &JSContext) {
-    // Pre-cache reflection method IDs from the safe init thread.
-    // This must happen here (not from hook callbacks) because FindClass
-    // triggers ART stack walking, which crashes inside hook trampolines.
+    // Spawn 模式: 跳过 JNI 初始化（由 deferred_java_init 在 resume 后完成）
+    // PID 注入模式: 立刻初始化
     if let Ok(env) = ensure_jni_initialized() {
         unsafe {
             cache_reflect_ids(env);
@@ -518,6 +568,7 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, java_obj, "_initArtController", js_java_init_art_controller, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_updateClassLoader", js_update_classloader, 1);
         add_cfunction_to_object(ctx_ptr, java_obj, "_isClassLoaderReady", js_is_classloader_ready, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_reprobeClassLoader", js_reprobe_classloader, 0);
         add_cfunction_to_object(ctx_ptr, java_obj, "_classLoaders", js_java_classloaders, 0);
         add_cfunction_to_object(
             ctx_ptr,

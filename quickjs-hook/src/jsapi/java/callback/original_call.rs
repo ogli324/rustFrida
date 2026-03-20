@@ -147,9 +147,7 @@ unsafe fn invoke_clone_jni(
     is_static: bool,
     jargs_ptr: *const std::ffi::c_void,
 ) -> u64 {
-    // Sync declaring_class_ (offset 0, 4B GcRoot): original → clone
-    let declaring_class = std::ptr::read_volatile(art_method_addr as *const u32);
-    std::ptr::write_volatile(clone_addr as *mut u32, declaring_class);
+    // 对标 Frida: declaring_class_ 不在热路径同步，由 GC 回调批量同步
     jni_check_exc(env);
 
     let clone_mid = clone_addr as *mut std::ffi::c_void;

@@ -162,61 +162,87 @@ fn main() {
         }
     }
 
-    // Spawn 模式下需要延迟恢复的子进程 PID
-    let spawn_pid: Option<u32> = if args.spawn.is_some() {
-        target_pid.map(|p| p as u32)
-    } else {
-        None
-    };
+    // Spawn 模式: jsinit → loadjs → resume
+    //
+    // 子进程在 setArgV0 阶段阻塞，ART 已完成基本 post-fork 初始化，
+    // AttachCurrentThread 可用。jsinit + loadjs 在 resume 前完成所有 hook 安装。
+    if let Some(ref _package) = args.spawn {
+        if let Some(pid) = target_pid {
+            if spawn::signal_received() {
+                log_info!("收到终止信号，正在清理...");
+                spawn::cleanup_zygote_patches();
+                std::process::exit(1);
+            }
+            // 在子进程暂停时完成: jsinit + loadjs → 所有 hook 就位 → 再 resume
+            if let Some(script_path) = &args.load_script {
+                match std::fs::read_to_string(script_path) {
+                    Ok(script) => {
+                        log_info!("加载脚本 (子进程暂停中): {}", script_path);
+                        eval_state().clear();
+                        if let Err(e) = send_command(sender, "jsinit") {
+                            log_error!("发送 jsinit 失败: {}", e);
+                        } else {
+                            match eval_state().recv_timeout(std::time::Duration::from_secs(10)) {
+                                None => log_warn!("等待引擎初始化超时"),
+                                Some(Err(e)) => log_error!("引擎初始化失败: {}", e),
+                                Some(Ok(_)) => {
+                                    let script_line = script.replace('\n', "\r");
+                                    eval_state().clear();
+                                    let cmd = format!("loadjs {}", script_line);
+                                    if let Err(e) = send_command(sender, cmd) {
+                                        log_error!("发送 loadjs 失败: {}", e);
+                                    } else {
+                                        print_eval_result(30);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log_error!("读取脚本文件 '{}' 失败: {}", script_path, e);
+                    }
+                }
+            }
+            // resume: hook 已就位，恢复子进程
+            if let Err(e) = spawn::resume_child(pid as u32) {
+                log_error!("恢复子进程失败: {}", e);
+            }
+        }
+    }
 
-    // Fix #2 & #7: --load-script 用 eval_state 等待 jsinit/loadjs 确认，而非 sleep(1)
-    if let Some(script_path) = &args.load_script {
-        match std::fs::read_to_string(script_path) {
-            Ok(script) => {
-                log_info!("加载脚本: {}", script_path);
-
-                // 等待 jsinit 确认引擎就绪
-                eval_state().clear();
-                if let Err(e) = send_command(sender, "jsinit") {
-                    log_error!("发送 jsinit 失败: {}", e);
-                } else {
-                    match eval_state().recv_timeout(std::time::Duration::from_secs(10)) {
-                        None => log_warn!("等待引擎初始化超时"),
-                        Some(Err(e)) => log_error!("引擎初始化失败: {}", e),
-                        Some(Ok(_)) => {
-                            // 引擎就绪，发送脚本
-                            // 用 \r 替换 \n 避免按行分割协议误判（JS 将 \r 视为行终止符）
-                            let script_line = script.replace('\n', "\r");
-                            eval_state().clear();
-                            let cmd = format!("loadjs {}", script_line);
-                            if let Err(e) = send_command(sender, cmd) {
-                                log_error!("发送 loadjs 失败: {}", e);
-                            } else {
-                                // 等待脚本执行结果
-                                print_eval_result(30);
+    // 非 spawn 模式: --load-script 在 resume 后加载（进程已在运行）
+    if args.spawn.is_none() {
+        if let Some(script_path) = &args.load_script {
+            match std::fs::read_to_string(script_path) {
+                Ok(script) => {
+                    log_info!("加载脚本: {}", script_path);
+                    eval_state().clear();
+                    if let Err(e) = send_command(sender, "jsinit") {
+                        log_error!("发送 jsinit 失败: {}", e);
+                    } else {
+                        match eval_state().recv_timeout(std::time::Duration::from_secs(10)) {
+                            None => log_warn!("等待引擎初始化超时"),
+                            Some(Err(e)) => log_error!("引擎初始化失败: {}", e),
+                            Some(Ok(_)) => {
+                                let script_line = script.replace('\n', "\r");
+                                eval_state().clear();
+                                let cmd = format!("loadjs {}", script_line);
+                                if let Err(e) = send_command(sender, cmd) {
+                                    log_error!("发送 loadjs 失败: {}", e);
+                                } else {
+                                    print_eval_result(30);
+                                }
                             }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                log_error!("读取脚本文件 '{}' 失败: {}", script_path, e);
+                Err(e) => {
+                    log_error!("读取脚本文件 '{}' 失败: {}", script_path, e);
+                }
             }
         }
     }
 
-    // Spawn 模式：脚本加载完成后（或无脚本时）恢复子进程
-    // 延迟 resume 确保 hook 在第一个生命周期回调之前生效
-    if let Some(pid) = spawn_pid {
-        if spawn::signal_received() {
-            log_info!("收到终止信号，正在清理...");
-            spawn::cleanup_zygote_patches();
-            std::process::exit(1);
-        }
-        if let Err(e) = spawn::resume_child(pid) {
-            log_error!("恢复子进程失败: {}", e);
-        }
-    }
 
     let mut rl = match Editor::new() {
         Ok(e) => e,

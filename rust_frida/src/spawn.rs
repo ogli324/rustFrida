@@ -183,6 +183,19 @@ fn is_boot_heap(entry: &MapEntry) -> bool {
             || entry.path.contains("dalvik-LinearAlloc"))
 }
 
+/// 判断给定地址是否在 boot heap 区域中
+fn is_boot_heap_addr(addr: u64, maps: &[MapEntry]) -> bool {
+    maps.iter().any(|e| is_boot_heap(e) && addr >= e.start && addr < e.end)
+}
+
+fn is_private_rw_mapping(entry: &MapEntry) -> bool {
+    entry.is_readable() && entry.is_writable() && !entry.is_executable() && !entry.is_shared()
+}
+
+fn is_readable_mapping(entry: &MapEntry) -> bool {
+    entry.is_readable()
+}
+
 /// 在 ELF dynsyms 中查找符号地址
 fn find_dynsym_addr(elf: &goblin::elf::Elf, name: &str, base: u64) -> Option<u64> {
     elf.dynsyms
@@ -1010,7 +1023,6 @@ fn inject_zymbiote(pid: u32, socket_name: &str) -> Result<ZygotePatch, String> {
     log_verbose!("Payload 写入完成");
 
     // 10. 替换 setArgV0 指针 → zymbiote replacement
-    //    already-patched 时：先用原始值还原，再写入新的替换值（与 Frida patches.apply + original 一致）
     mem.pwrite_all(&replacement_setargv0_addr.to_ne_bytes(), setargv0_ptr_addr)?;
     log_verbose!(
         "setArgV0 指针已替换: 0x{:x} → 0x{:x}",
@@ -1273,47 +1285,144 @@ fn find_setargv0_pointer_in_heap(
     let replaced_needle = replaced_setargv0_addr.map(|a| a.to_ne_bytes());
     let mem = ProcMem::open(pid)?;
 
-    // 搜索候选区域：boot.art / boot-framework.art / dalvik-LinearAlloc（R+W 非 X 非 shared）
-    // 与 Frida is_boot_heap() 一致
-    let candidates: Vec<&MapEntry> = maps.iter().filter(|e| is_boot_heap(e)).collect();
+    let search_candidates = |candidates: &[&MapEntry]| -> Result<Option<(u64, [u8; 8], bool)>, String> {
+        let mut matches = Vec::new();
 
-    log_verbose!("搜索 {} 个 boot heap 区域查找 setArgV0 指针", candidates.len());
+        for entry in candidates {
+            let size = (entry.end - entry.start) as usize;
+            let mut buf = vec![0u8; size];
 
-    for entry in &candidates {
-        let size = (entry.end - entry.start) as usize;
-        let mut buf = vec![0u8; size];
-
-        if mem.pread_exact(&mut buf, entry.start).is_err() {
-            continue;
-        }
-
-        // 搜索 original needle
-        for offset in (0..buf.len().saturating_sub(7)).step_by(8) {
-            if buf[offset..offset + 8] == original_needle {
-                let addr = entry.start + offset as u64;
-                let mut backup = [0u8; 8];
-                backup.copy_from_slice(&original_needle);
-                return Ok((addr, backup, false));
+            if mem.pread_exact(&mut buf, entry.start).is_err() {
+                continue;
             }
-        }
 
-        // 搜索 replaced needle（already-patched 检测）
-        if let Some(ref replaced) = replaced_needle {
+            // 搜索 original needle（指针 8 字节对齐）
             for offset in (0..buf.len().saturating_sub(7)).step_by(8) {
-                if buf[offset..offset + 8] == *replaced {
+                if buf[offset..offset + 8] == original_needle {
                     let addr = entry.start + offset as u64;
-                    // 备份是原始值，不是替换后的值
                     let mut backup = [0u8; 8];
                     backup.copy_from_slice(&original_needle);
-                    log_warn!("setArgV0 指针已被替换（already patched），slot at 0x{:x}", addr);
-                    return Ok((addr, backup, true));
+                    matches.push((addr, backup, false, entry.path.clone(), entry.is_executable()));
+                }
+            }
+
+            // 搜索 replaced needle（already-patched 检测）
+            if let Some(ref replaced) = replaced_needle {
+                for offset in (0..buf.len().saturating_sub(7)).step_by(8) {
+                    if buf[offset..offset + 8] == *replaced {
+                        let addr = entry.start + offset as u64;
+                        let mut backup = [0u8; 8];
+                        backup.copy_from_slice(&original_needle);
+                        matches.push((addr, backup, true, entry.path.clone(), entry.is_executable()));
+                    }
                 }
             }
         }
+
+        if matches.is_empty() {
+            return Ok(None);
+        }
+
+        matches.sort_by_key(|(addr, _, _, _, _)| *addr);
+        matches.dedup_by_key(|(addr, _, _, _, _)| *addr);
+
+        if matches.len() > 1 {
+            let runtime_matches: Vec<_> = matches
+                .iter()
+                .filter(|(_, _, _, path, _)| path.ends_with("/libandroid_runtime.so"))
+                .cloned()
+                .collect();
+            if runtime_matches.len() == 1 {
+                let (addr, backup, already_patched, _, _) = runtime_matches[0].clone();
+                log_warn!(
+                    "多个 setArgV0 候选中优先选择 libandroid_runtime.so 内的 slot: 0x{:x}",
+                    addr
+                );
+                return Ok(Some((addr, backup, already_patched)));
+            }
+
+            let non_exec_matches: Vec<_> = matches
+                .iter()
+                .filter(|(_, _, _, _, is_exec)| !*is_exec)
+                .cloned()
+                .collect();
+            if non_exec_matches.len() == 1 {
+                let (addr, backup, already_patched, _, _) = non_exec_matches[0].clone();
+                log_warn!(
+                    "多个 setArgV0 候选中优先选择非可执行映射内的 slot: 0x{:x}",
+                    addr
+                );
+                return Ok(Some((addr, backup, already_patched)));
+            }
+
+            let summary = matches
+                .iter()
+                .take(4)
+                .map(|(addr, _, already_patched, path, is_exec)| {
+                    format!(
+                        "0x{:x}{}{} @ {}",
+                        addr,
+                        if *already_patched { " [patched]" } else { "" },
+                        if *is_exec { " [exec]" } else { "" },
+                        path
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "找到多个 setArgV0 指针候选 ({} 个): {}",
+                matches.len(),
+                summary
+            ));
+        }
+
+        let (addr, backup, already_patched, _, _) = matches.remove(0);
+        if already_patched {
+            log_warn!("setArgV0 指针已被替换（already patched），slot at 0x{:x}", addr);
+        }
+        Ok(Some((addr, backup, already_patched)))
+    };
+
+    // 搜索候选区域：boot.art / boot-framework.art / dalvik-LinearAlloc（R+W 非 X 非 shared）
+    // 与 Frida is_boot_heap() 一致
+    let preferred: Vec<&MapEntry> = maps.iter().filter(|e| is_boot_heap(e)).collect();
+    log_verbose!("搜索 {} 个 boot heap 区域查找 setArgV0 指针", preferred.len());
+    if let Some(found) = search_candidates(&preferred)? {
+        return Ok(found);
+    }
+
+    // Android 16 / 新版本 ART 上，slot 可能不再落在传统 boot heap/LinearAlloc 区域。
+    // 回退到所有 RW private 映射，并要求唯一命中，避免误改。
+    let fallback: Vec<&MapEntry> = maps
+        .iter()
+        .filter(|e| is_private_rw_mapping(e))
+        .filter(|e| !is_boot_heap(e))
+        .collect();
+    log_warn!(
+        "boot heap 中未命中 setArgV0 指针，回退扫描 {} 个 RW private 区域",
+        fallback.len()
+    );
+    if let Some(found) = search_candidates(&fallback)? {
+        return Ok(found);
+    }
+
+    // 再退一层：某些新系统可能把 slot 放在只读或 shared 映射中。
+    // 这里扩大到所有可读映射，但仍要求唯一命中。
+    let final_fallback: Vec<&MapEntry> = maps
+        .iter()
+        .filter(|e| is_readable_mapping(e))
+        .filter(|e| !is_private_rw_mapping(e))
+        .collect();
+    log_warn!(
+        "RW private 区域未命中 setArgV0 指针，继续扫描 {} 个其余可读区域",
+        final_fallback.len()
+    );
+    if let Some(found) = search_candidates(&final_fallback)? {
+        return Ok(found);
     }
 
     Err(format!(
-        "未在 boot heap 中找到 setArgV0 指针 (0x{:x})，目标进程可能不兼容",
+        "未在 boot heap、RW private 或其余可读区域中找到 setArgV0 指针 (0x{:x})，目标进程可能不兼容",
         setargv0_addr
     ))
 }

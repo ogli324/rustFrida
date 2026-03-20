@@ -79,15 +79,48 @@ pub(super) unsafe fn prepare_hook_target(
         StealthMode::Normal => Ok((real_addr, 0)),
         StealthMode::WxShadow => Ok((real_addr, 1)),
         StealthMode::Recomp => {
+            // Recomp 模式: hook 装在 recomp 页上，只覆盖 4 字节 (B 指令)。
+            // sflag=2 让 hook engine 用 B 指令而不是 full jump，保持 offset 对应。
             let recomp = crate::recomp::ensure_and_translate(real_addr as usize)
                 .map_err(|e| format!("recomp translate {:#x}: {}", real_addr, e))?;
-            Ok((recomp as u64, 0))
+            Ok((recomp as u64, 2))
         }
     }
 }
 
 // ============================================================================
-// forced_interpret_only — 阻止 JIT 重编译被 hook 方法
+// DeoptimizeBootImage — 对标 Frida
+// ============================================================================
+
+/// 调用 art::Runtime::DeoptimizeBootImage() 将 boot image 中所有 AOT 编译方法
+/// 的 entry_point 改为 interpreter_bridge，确保调用走 interpreter → DoCall 路径。
+unsafe fn call_deoptimize_boot_image() {
+    let sym = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime19DeoptimizeBootImageEv");
+    if sym.is_null() {
+        output_message("[deopt] DeoptimizeBootImage 符号未找到，跳过");
+        return;
+    }
+
+    let runtime = match get_runtime_addr() {
+        Some(r) => r,
+        None => {
+            output_message("[deopt] Runtime 地址不可用，跳过 DeoptimizeBootImage");
+            return;
+        }
+    };
+
+    type DeoptFn = unsafe extern "C" fn(runtime: u64);
+    let deopt: DeoptFn = std::mem::transmute(sym);
+    output_message(&format!(
+        "[deopt] 调用 DeoptimizeBootImage: func={:#x}, runtime={:#x}",
+        sym as u64, runtime
+    ));
+    deopt(runtime);
+    output_message("[deopt] DeoptimizeBootImage 完成");
+}
+
+// ============================================================================
+// forced_interpret_only — 阻止 JIT 重编译被 hook 方法 (已弃用)
 // ============================================================================
 
 /// 原始 forced_interpret_only_ 值 (0=未设置, 1=原始为0已设为1, 2=原始已为1)
@@ -184,6 +217,10 @@ unsafe fn restore_forced_interpret_only() {
 // ArtController 状态
 // ============================================================================
 
+/// Layer 1 jni_trampoline 的 bypass 地址 (trampoline, 包含原始代码副本)
+#[allow(dead_code)]
+static JNI_TRAMPOLINE_BYPASS: AtomicU64 = AtomicU64::new(0);
+
 /// 记录已安装的 artController 全局 hook 信息
 struct ArtControllerState {
     /// Layer 1: 已 hook 的共享 stub 地址 (jni_trampoline, interpreter_bridge, resolution)
@@ -239,17 +276,25 @@ pub(super) fn ensure_art_controller_initialized(
         try_invalidate_jit_cache();
     }
 
-    // B4: 设置 forced_interpret_only — 阻止 JIT 重编译
-    unsafe {
-        set_forced_interpret_only();
-    }
+    // 注意: DeoptimizeBootImage 和 forced_interpret_only 不再自动调用。
+    // Frida 中这些是可选功能 (Java.deopt())，不是 hook 安装的前置条件。
+    // 自动调用会导致所有方法走 interpreter → 进程启动极慢 → ActivityManager kill。
+    // Hook 路由依靠:
+    //   - Layer 1 (shared stub hooks) + Layer 2 (DoCall) 覆盖 interpreter 路径
+    //   - Layer 3 (per-method quickCode hook) 覆盖 compiled 路径
+    //   - install.rs 中 nterp → interpreter_bridge 降级确保 nterp 方法走 Layer 1
 
     let mut shared_stub_targets = Vec::new();
     let mut do_call_targets = Vec::new();
 
     // --- Layer 1: 共享 stub 路由 hook ---
+    // 跳过 jni_trampoline: spawn 模式下 resume_child 之后才安装 hooks，
+    // 子进程主线程正在高频调用 JNI。inline hook jni_trampoline 的 prologue
+    // 覆写与执行存在竞态 → SIGSEGV。Frida 用 Memory.patchCode() 暂停所有
+    // 线程后 patch，我们目前没有这个机制。
+    // replacement 方法的 quickCode 仍指向 jni_trampoline（不经过 Layer 1），
+    // 路由通过 Layer 2 (DoCall) 和 Layer 3 (per-method hook) 覆盖。
     let stubs = [
-        ("quick_generic_jni_trampoline", bridge.quick_generic_jni_trampoline),
         ("quick_to_interpreter_bridge", bridge.quick_to_interpreter_bridge),
         ("quick_resolution_trampoline", bridge.quick_resolution_trampoline),
     ];
@@ -285,10 +330,20 @@ pub(super) fn ensure_art_controller_initialized(
                 *addr
             };
             shared_stub_targets.push(actual_target);
+
+            // 保存 jni_trampoline 的 bypass (trampoline) 地址
+            if *name == "quick_generic_jni_trampoline" {
+                JNI_TRAMPOLINE_BYPASS.store(trampoline as u64, Ordering::Release);
+            }
+
             output_message(&format!(
                 "[artController] Layer 1: {} hook 安装成功: {:#x} (hooked={:#x}), trampoline={:#x}",
                 name, addr, actual_target, trampoline as u64
             ));
+            // 验证 inline hook 是否真的写入
+            unsafe {
+                hook_ffi::hook_dump_code(actual_target as *mut std::ffi::c_void, 20);
+            }
         } else {
             output_message(&format!("[artController] Layer 1: {} hook 安装失败: {:#x}", name, addr));
         }
@@ -460,8 +515,26 @@ pub(super) fn ensure_art_controller_initialized(
         }
     }
 
+    // --- Fix 8: OAT inline patch ---
+    // 暂时仅在 PID 注入模式启用（spawn 模式下 mprotect COW 可能导致问题）
+    // TODO: 判断 spawn vs pid 模式
+    let oat_inline_patched = unsafe {
+        hook_ffi::hook_patch_inlined_oat_header_checks()
+    };
+    if oat_inline_patched > 0 {
+        output_message(&format!(
+            "[artController] Fix 8: {} 个内联 GetOatQuickMethodHeader 已 patch",
+            oat_inline_patched
+        ));
+    }
+
+    // SIGSEGV guard 作为 fallback
+    unsafe {
+        install_walkstack_sigsegv_guard();
+    }
+
     output_message(&format!(
-        "[artController] 初始化完成: Layer1={}, Layer2={}, GC={}, OatHeader={}, Fixup={}, PrettyMethod={}",
+        "[artController] 初始化完成: Layer1={}, Layer2={}, GC={}, OatHeader={}, Fixup={}, PrettyMethod={}, InlinePatch={}",
         shared_stub_targets.len(),
         do_call_targets.len(),
         gc_hook_targets.len(),
@@ -472,6 +545,7 @@ pub(super) fn ensure_art_controller_initialized(
         } else {
             "none"
         },
+        if oat_inline_patched > 0 { oat_inline_patched } else { 0 },
     ));
 
     *controller = Some(ArtControllerState {
@@ -496,6 +570,9 @@ fn get_art_thread_spec_cached() -> Option<&'static ArtThreadSpec> {
     }
 }
 
+pub(super) static DO_CALL_COUNT: AtomicU64 = AtomicU64::new(0);
+pub(super) static DO_CALL_HIT_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// DoCall on_enter: 检查 x0 (ArtMethod*) 是否在 replacedMethods 中，有则替换。
 /// 包含递归防护: 如果当前栈帧来自 callOriginal (managedStack 中已有 replacement)，
 /// 则跳过替换，让 original method 正常执行，防止无限递归。
@@ -505,16 +582,15 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
     }
     let ctx = &mut *ctx_ptr;
     let method = ctx.x[0];
+    DO_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     if let Some(replacement) = get_replacement_method(method) {
+        DO_CALL_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
         // 递归防护: 检查 managedStack 是否表明这是 callOriginal 发起的调用
         if !should_replace_for_stack(replacement) {
             return; // 递归情况，保持 original 不替换
         }
-        // 同步 declaring_class_ (offset 0, 4B GcRoot): original → replacement
-        // GC 可能已更新 original 的 declaring_class_ 但堆分配的 replacement 未被 GC 追踪，
-        // 在路由时内联同步消除 GC 与 sync 回调之间的竞态窗口
-        let declaring_class = std::ptr::read_volatile(method as *const u32);
-        std::ptr::write_volatile(replacement as *mut u32, declaring_class);
+        // 对标 Frida: declaring_class_ 不在热路径同步，仅由 GC 回调批量同步
+        // （在热路径写 malloc 地址会导致 Scudo 堆损坏）
         ctx.x[0] = replacement;
     }
 }
@@ -631,12 +707,20 @@ unsafe extern "C" fn on_gc_sync_enter(_ctx_ptr: *mut hook_ffi::HookContext, _use
 
 /// Fix 4: GetOatQuickMethodHeader replace-mode 回调
 ///
-/// 对 replacement ArtMethod 返回 NULL，防止 ART 查找堆分配方法的 OAT 代码头。
+/// 对 replacement ArtMethod 返回 dummy header，防止 ART 查找堆分配方法的 OAT 代码头。
+/// 返回 NULL 会导致 API 36 的 WalkStack 空指针崩溃（offset 0x18 解引用），
+/// 所以改为返回一个全零的静态 dummy header，让 WalkStack 安全跳过。
 /// 对其他方法调用原始实现。
+///
+/// dummy header 全零意味着 code_size=0，WalkStack 的 PC 范围检查不通过，
+/// 会跳过该帧继续遍历，不会崩溃。
 unsafe extern "C" fn on_get_oat_quick_method_header(
     ctx_ptr: *mut hook_ffi::HookContext,
     _user_data: *mut std::ffi::c_void,
 ) {
+    // 64 字节全零 dummy header — 足够覆盖 OatQuickMethodHeader 各版本的字段
+    static DUMMY_OAT_HEADER: [u8; 64] = [0u8; 64];
+
     if ctx_ptr.is_null() {
         return;
     }
@@ -644,8 +728,8 @@ unsafe extern "C" fn on_get_oat_quick_method_header(
     let method = ctx.x[0]; // ArtMethod* this
 
     if is_replacement_method(method) {
-        // replacement method → return NULL
-        ctx.x[0] = 0;
+        // replacement method → 返回 dummy header（非 NULL，但所有字段为 0）
+        ctx.x[0] = DUMMY_OAT_HEADER.as_ptr() as u64;
     } else {
         // 非 replacement → 调用原始实现
         let trampoline = ctx.trampoline;
@@ -700,9 +784,9 @@ unsafe fn synchronize_replacement_methods() {
         // --- Fix 1: declaring_class_ 同步 ---
         // 移动 GC 会更新原始 ArtMethod 的 declaring_class_ (offset 0, 4 bytes GcRoot)，
         // 但堆分配的 replacement 和 clone 不会被 GC 追踪。同步以防悬空引用。
-        let HookType::Replaced { replacement_addr, .. } = &data.hook_type;
         {
             let declaring_class = std::ptr::read_volatile(art_method as *const u32);
+            let HookType::Replaced { replacement_addr, .. } = &data.hook_type;
             std::ptr::write_volatile(*replacement_addr as *mut u32, declaring_class);
             // 同步到 clone (callOriginal 使用的备份 ArtMethod)
             if data.clone_addr != 0 {
@@ -720,33 +804,105 @@ unsafe fn synchronize_replacement_methods() {
         }
 
         // --- Fix 2 + existing: entry_point 验证与恢复 ---
-        match &data.hook_type {
-            HookType::Replaced {
-                per_method_hook_target: None,
-                ..
-            } => {
-                // 共享 stub 方法: 如果 GC 重置 entry_point 为 nterp，再降级为 interpreter_bridge
-                if nterp != 0 && interp_bridge != 0 {
-                    let current_ep = read_entry_point(data.art_method, ep_offset);
-                    if current_ep == nterp {
-                        std::ptr::write_volatile((art_method + ep_offset) as *mut u64, interp_bridge);
-                        hook_ffi::hook_flush_cache((art_method + ep_offset) as *mut std::ffi::c_void, 8);
-                    }
-                }
-            }
-            HookType::Replaced {
-                per_method_hook_target: Some(_),
-                ..
-            } => {
-                // 编译方法: entry_point 应为 original_entry_point (已被 inline hook 修改)
+        // 对标 Frida synchronize_replacement_methods: nterp → quick_to_interpreter_bridge
+        let HookType::Replaced { per_method_hook_target, .. } = &data.hook_type;
+        if per_method_hook_target.is_none() {
+            // 共享 stub 方法: 如果 GC 重置 entry_point 为 nterp，再降级为 interpreter_bridge
+            if nterp != 0 && interp_bridge != 0 {
                 let current_ep = read_entry_point(data.art_method, ep_offset);
-                if current_ep != data.original_entry_point {
-                    // GC/类初始化 重置了 entry_point (可能变为 nterp)，恢复到被 patch 的原始地址
-                    std::ptr::write_volatile((art_method + ep_offset) as *mut u64, data.original_entry_point);
+                if current_ep == nterp {
+                    std::ptr::write_volatile((art_method + ep_offset) as *mut u64, interp_bridge);
                     hook_ffi::hook_flush_cache((art_method + ep_offset) as *mut std::ffi::c_void, 8);
                 }
             }
+        } else {
+            // 编译方法: entry_point 应为 original_entry_point (已被 inline hook 修改)
+            // 但 GC/类初始化可能将 ep 重置为 nterp → 降级为 interpreter_bridge
+            let current_ep = read_entry_point(data.art_method, ep_offset);
+            if current_ep != data.original_entry_point {
+                if nterp != 0 && current_ep == nterp && interp_bridge != 0 {
+                    std::ptr::write_volatile((art_method + ep_offset) as *mut u64, interp_bridge);
+                } else {
+                    std::ptr::write_volatile((art_method + ep_offset) as *mut u64, data.original_entry_point);
+                }
+                hook_ffi::hook_flush_cache((art_method + ep_offset) as *mut std::ffi::c_void, 8);
+            }
         }
+    }
+}
+
+// ============================================================================
+// Fix 8: WalkStack NULL OatQuickMethodHeader SIGSEGV guard
+// ============================================================================
+//
+// API 36 的 WalkStack 内联了 GetOatQuickMethodHeader 逻辑。对被 hook 的方法，
+// 内联查找返回 NULL 后直接执行 LDR W9, [X10, #0x18] (X10=NULL) → SIGSEGV。
+// 注册 SIGSEGV handler: 当 fault_addr==0x18 时，将 X10 指向全零 dummy buffer，
+// 跳过无效访问恢复执行。
+
+/// 64 字节全零 dummy — 足够覆盖 OatQuickMethodHeader 各版本的字段
+static DUMMY_OAT_HEADER_BUF: [u8; 64] = [0u8; 64];
+
+/// 旧的 SIGSEGV handler (chain 用)
+static mut PREV_SIGSEGV_ACTION: libc::sigaction = unsafe { std::mem::zeroed() };
+static WALKSTACK_GUARD_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "C" fn walkstack_sigsegv_handler(
+    sig: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    if !info.is_null() && !context.is_null() {
+        let fault_addr = (*info).si_addr() as u64;
+        // 精准匹配: fault_addr == 0x18 说明是 NULL+0x18 解引用 (OAT header 字段访问)
+        if fault_addr == 0x18 {
+            let uc = context as *mut libc::ucontext_t;
+            let regs = &mut (*uc).uc_mcontext.regs;
+            // X10 = regs[10], 如果 X10 == 0 说明是我们关心的 WalkStack NULL header 场景
+            if regs[10] == 0 {
+                // 修复: X10 指向 dummy buffer，让后续 LDR 读到 0 而不是崩溃
+                regs[10] = DUMMY_OAT_HEADER_BUF.as_ptr() as u64;
+                // 不需要修改 PC — 返回后重新执行同一条 LDR 指令，这次 X10 有效
+                return;
+            }
+        }
+    }
+
+    // 不是我们关心的场景 → chain 到旧 handler
+    let prev = &PREV_SIGSEGV_ACTION;
+    let prev_handler = prev.sa_sigaction;
+    if prev.sa_flags & libc::SA_SIGINFO != 0 {
+        let handler: unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) =
+            std::mem::transmute(prev_handler);
+        handler(sig, info, context);
+    } else if prev_handler == libc::SIG_DFL {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    } else if prev_handler != libc::SIG_IGN {
+        let simple: unsafe extern "C" fn(libc::c_int) = std::mem::transmute(prev_handler);
+        simple(sig);
+    }
+}
+
+unsafe fn install_walkstack_sigsegv_guard() {
+    if WALKSTACK_GUARD_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let mut sa: libc::sigaction = std::mem::zeroed();
+    sa.sa_sigaction = walkstack_sigsegv_handler as usize;
+    sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+    libc::sigemptyset(&mut sa.sa_mask);
+
+    let ret = libc::sigaction(libc::SIGSEGV, &sa, &mut PREV_SIGSEGV_ACTION);
+    if ret == 0 {
+        output_message("[artController] WalkStack SIGSEGV guard 已安装");
+    } else {
+        output_message(&format!(
+            "[artController] WalkStack SIGSEGV guard 安装失败: {}",
+            std::io::Error::last_os_error()
+        ));
+        WALKSTACK_GUARD_INSTALLED.store(false, Ordering::SeqCst);
     }
 }
 
@@ -798,6 +954,14 @@ pub(super) fn cleanup_art_controller() {
     for (_label, addr) in &all_targets {
         unsafe {
             hook_ffi::hook_remove(*addr as *mut std::ffi::c_void);
+        }
+    }
+
+    // 恢复内联 OAT header patch
+    unsafe {
+        let restored = hook_ffi::hook_restore_inlined_oat_header_patches();
+        if restored > 0 {
+            output_message(&format!("[artController] 恢复了 {} 个内联 OAT patch", restored));
         }
     }
 

@@ -200,25 +200,47 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     };
     install_guard.set_replacement_addr(replacement_addr);
 
+    // Clone+Replace 模式 (对标 Frida):
+    // 原始 ArtMethod 仅修改 flags (deopt)，不设 kAccNative。
+    // replacement ArtMethod (heap) 设为 kAccNative + jniCode=thunk + quickCode=jni_trampoline。
+    // 通过 artController Layer 1+2+3 路由 original → replacement。
+
+    // B1: 确保 artController 已初始化 (Layer 1 + Layer 2 全局 hook)
+    ensure_art_controller_initialized(&bridge, ep_offset, env as *mut std::ffi::c_void);
+
+    // B2: 注册 replacement 到 replacedMethods 映射 (art_router 查表用)
+    set_replacement_method(art_method, replacement_addr as u64);
+    install_guard.set_replacement_registered();
+
+    // B3: 修改原始 ArtMethod flags (对标 Frida android.js:3732-3741)
+    // 不设 kAccNative! 仅 deopt + 清除快速路径标志
     update_original_method_flags_for_hook(art_method, spec.access_flags_offset, original_access_flags);
     install_guard.set_original_method_mutated();
 
-    ensure_art_controller_initialized(bridge, ep_offset, env as *mut std::ffi::c_void);
+    // B4: nterp → interpreter_bridge 降级 (对标 Frida android.js:3747-3750)
+    if bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point {
+        let interp_bridge = bridge.quick_to_interpreter_bridge;
+        if interp_bridge != 0 {
+            std::ptr::write_volatile(
+                (art_method as usize + ep_offset) as *mut u64,
+                interp_bridge,
+            );
+            hook_ffi::hook_flush_cache(
+                (art_method as usize + ep_offset) as *mut std::ffi::c_void,
+                8,
+            );
+            output_message(&format!(
+                "[java hook] nterp → interpreter_bridge: {:#x} → {:#x}",
+                original_entry_point, interp_bridge
+            ));
+        }
+    }
 
-    set_replacement_method(art_method, replacement_addr as u64);
-    install_guard.set_replacement_registered();
-    output_message(&format!(
-        "[java hook] Step 8: replacedMethods.set({:#x}, {:#x})",
-        art_method, replacement_addr
-    ));
-
-    hook_ffi::hook_art_router_table_dump();
-    hook_ffi::hook_art_router_debug_scan(art_method);
-
+    // B5: Layer 3 per-method router hook (对标 Frida ArtQuickCodeInterceptor)
     let per_method_hook_target = match install_per_method_router_hook(
         has_independent_code,
         original_entry_point,
-        bridge,
+        &bridge,
         ep_offset,
         env,
         clone_addr,

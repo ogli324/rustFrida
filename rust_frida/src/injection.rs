@@ -51,6 +51,36 @@ fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
     Ok(host_fd as RawFd)
 }
 
+/// 设置 fd 的 SELinux label，使 untrusted_app 能通过 SCM_RIGHTS 接收。
+///
+/// Android MLS/MCS 会阻止 untrusted_app (带 categories) 访问 tmpfs:s0 (无 categories)。
+/// 参考 Frida: 创建 frida_memfd 类型 (带 mlstrustedobject 属性) 豁免 MLS 检查。
+/// 我们复用 Frida 已创建的 frida_memfd 类型（如果存在于策略中）。
+fn relabel_fd_for_injection(fd: RawFd) {
+    // 尝试的 SELinux context 列表（按优先级）
+    const LABELS: &[&[u8]] = &[
+        b"u:object_r:frida_memfd:s0\0",
+        b"u:object_r:app_data_file:s0\0",
+    ];
+    for label in LABELS {
+        let ret = unsafe {
+            libc::fsetxattr(
+                fd,
+                b"security.selinux\0".as_ptr() as *const libc::c_char,
+                label.as_ptr() as *const c_void,
+                label.len() - 1, // 不包含 NUL
+                0,
+            )
+        };
+        if ret == 0 {
+            let name = std::str::from_utf8(&label[..label.len() - 1]).unwrap_or("?");
+            log_verbose!("memfd SELinux label → {}", name);
+            return;
+        }
+    }
+    log_verbose!("memfd SELinux relabel 全部失败，使用默认 tmpfs label");
+}
+
 /// 根据 UID 查找 /data/data/ 目录下对应的应用数据目录
 fn find_data_dir_by_uid(uid: u32) -> Option<String> {
     use std::fs;
@@ -314,10 +344,14 @@ fn run_loader_handshake(ctrl_fd: RawFd) -> Result<RawFd, String> {
     log_verbose!("Loader worker tid: {}", thread_id);
 
     // 2. 发送 agent SO fd (创建 memfd → 写入 AGENT_SO → sendmsg)
+    //    关键: 必须设置 SELinux label 为 frida_memfd (带 mlstrustedobject 属性)，
+    //    否则 untrusted_app 因 MLS 分类不匹配无法通过 SCM_RIGHTS 接收 tmpfs fd。
     let agent_memfd = unsafe { libc::memfd_create(b"agent\0".as_ptr() as _, 0) };
     if agent_memfd < 0 {
         return Err(format!("memfd_create 失败: {}", std::io::Error::last_os_error()));
     }
+    // 尝试 relabel memfd → frida_memfd (绕过 MLS)
+    relabel_fd_for_injection(agent_memfd);
     let mut written = 0usize;
     while written < AGENT_SO.len() {
         let n = unsafe {
@@ -559,6 +593,17 @@ pub(crate) fn inject_via_bootstrapper(
             let _ = ptrace::detach(Pid::from_raw(pid), None);
             format!("loader 执行失败: {}", e)
         })?;
+
+    // === 分离前验证寄存器状态 ===
+    {
+        let final_regs = crate::process::get_registers_pub(pid);
+        if let Ok(r) = final_regs {
+            log_verbose!(
+                "分离前寄存器: PC={:#x} SP={:#x} LR={:#x} FP(x29)={:#x} x19={:#x}",
+                r.pc, r.sp, r.regs[30], r.regs[29], r.regs[19]
+            );
+        }
+    }
 
     // === ptrace 分离 ===
     if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {

@@ -1068,6 +1068,115 @@ pub(super) fn is_classloader_ready() -> bool {
     REFLECT_IDS.get().map_or(false, |r| !r.app_classloader.is_null())
 }
 
+/// 主动重新探测 app ClassLoader（spawn resume-first 场景）。
+/// jsinit 时 app 可能尚未初始化，此函数在 Java.ready 安装 hook 后再次尝试，
+/// 通过 ActivityThread.currentActivityThread().getApplication().getClassLoader() 探测。
+/// 如果成功，更新缓存的 classloader 并返回 true。
+/// 最多重试 50 次（每次 100ms sleep），总等待 ~5s。
+pub(super) unsafe fn reprobe_classloader() -> bool {
+    if is_classloader_ready() {
+        return true;
+    }
+    // Poll: app 初始化需要时间，重试几次
+    for attempt in 0..50 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if reprobe_classloader_once() {
+            crate::jsapi::console::output_message(
+                &format!("[Java.ready] reprobe succeeded after {}ms", attempt * 100)
+            );
+            return true;
+        }
+    }
+    crate::jsapi::console::output_message("[Java.ready] reprobe_classloader: 5s timeout, app not ready");
+    false
+}
+
+unsafe fn reprobe_classloader_once() -> bool {
+    if is_classloader_ready() {
+        return true;
+    }
+    let env = match super::jni_core::get_thread_env() {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    let reflect = match REFLECT_IDS.get() {
+        Some(r) => r,
+        None => return false,
+    };
+    // 如果已有 classloader，不需要重新探测
+    if !reflect.app_classloader.is_null() {
+        return true;
+    }
+
+    let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
+    let get_static_mid: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
+    let call_static_obj_a: CallStaticObjectMethodAFn = jni_fn!(env, CallStaticObjectMethodAFn, JNI_CALL_STATIC_OBJECT_METHOD_A);
+    let call_obj_a: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
+    let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+    let new_global_ref: NewGlobalRefFn = jni_fn!(env, NewGlobalRefFn, JNI_NEW_GLOBAL_REF);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    let null_args: *const std::ffi::c_void = std::ptr::null();
+
+    let c_at = CString::new("android/app/ActivityThread").unwrap();
+    let at_cls = find_class(env, c_at.as_ptr());
+    if at_cls.is_null() || jni_check_exc(env) { return false; }
+
+    let c_cur = CString::new("currentActivityThread").unwrap();
+    let c_cur_sig = CString::new("()Landroid/app/ActivityThread;").unwrap();
+    let cur_mid = get_static_mid(env, at_cls, c_cur.as_ptr(), c_cur_sig.as_ptr());
+    if cur_mid.is_null() || jni_check_exc(env) { delete_local_ref(env, at_cls); return false; }
+
+    let at_obj = call_static_obj_a(env, at_cls, cur_mid, null_args);
+    if at_obj.is_null() || jni_check_exc(env) { delete_local_ref(env, at_cls); return false; }
+
+    let c_get_app = CString::new("getApplication").unwrap();
+    let c_get_app_sig = CString::new("()Landroid/app/Application;").unwrap();
+    let get_app_mid = get_mid(env, at_cls, c_get_app.as_ptr(), c_get_app_sig.as_ptr());
+    if get_app_mid.is_null() || jni_check_exc(env) { delete_local_ref(env, at_obj); delete_local_ref(env, at_cls); return false; }
+
+    let app = call_obj_a(env, at_obj, get_app_mid, null_args);
+    delete_local_ref(env, at_obj);
+    delete_local_ref(env, at_cls);
+    if app.is_null() || jni_check_exc(env) { return false; }
+
+    let c_ctx = CString::new("android/content/Context").unwrap();
+    let ctx_cls = find_class(env, c_ctx.as_ptr());
+    if ctx_cls.is_null() || jni_check_exc(env) { delete_local_ref(env, app); return false; }
+
+    let c_gcl = CString::new("getClassLoader").unwrap();
+    let c_gcl_sig = CString::new("()Ljava/lang/ClassLoader;").unwrap();
+    let gcl_mid = get_mid(env, ctx_cls, c_gcl.as_ptr(), c_gcl_sig.as_ptr());
+    delete_local_ref(env, ctx_cls);
+    if gcl_mid.is_null() || jni_check_exc(env) { delete_local_ref(env, app); return false; }
+
+    let cl = call_obj_a(env, app, gcl_mid, null_args);
+    delete_local_ref(env, app);
+    if cl.is_null() || jni_check_exc(env) { return false; }
+
+    // 成功！更新缓存 — 用 UnsafeCell 式写入（REFLECT_IDS 已初始化，字段是裸指针）
+    let r = REFLECT_IDS.get().unwrap() as *const ReflectIds as *mut ReflectIds;
+    (*r).app_classloader = new_global_ref(env, cl);
+
+    // 同时获取 loadClass method ID
+    let c_cl_cls = CString::new("java/lang/ClassLoader").unwrap();
+    let cl_cls = find_class(env, c_cl_cls.as_ptr());
+    if !cl_cls.is_null() && !jni_check_exc(env) {
+        let c_lc = CString::new("loadClass").unwrap();
+        let c_lc_sig = CString::new("(Ljava/lang/String;)Ljava/lang/Class;").unwrap();
+        let lc_mid = get_mid(env, cl_cls, c_lc.as_ptr(), c_lc_sig.as_ptr());
+        if !lc_mid.is_null() && !jni_check_exc(env) {
+            (*r).load_class_mid = lc_mid;
+        }
+        delete_local_ref(env, cl_cls);
+    }
+    delete_local_ref(env, cl);
+
+    crate::jsapi::console::output_message("[Java.ready] reprobe_classloader: app ClassLoader found");
+    true
+}
+
 /// Resolve a class name directly via `Class.getName()`.
 ///
 /// This is intended for JNI refs we already obtained from the VM, such as the
@@ -1116,23 +1225,45 @@ pub(super) unsafe fn find_class_safe(env: JniEnv, class_name: &str) -> *mut std:
     // ART's FindClass asserts no pending exception — calling it with one → SIGABRT.
     jni_check_exc(env);
 
-    let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
+    // 优先使用 ClassLoader.loadClass（不触发 WalkStack）。
+    // FindClass 内部调用 GetCallingClass → WalkStack，在 hook 回调中会因为
+    // 栈帧上有被 hook 的方法（entry_point 已改变）导致 OAT header 查找失败 → SIGSEGV (API 36)。
+    // ClassLoader.loadClass 通过 CallObjectMethodA 调用，不做 stack walk，安全。
+    let has_classloader = {
+        let ovr_cl = CL_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+        let ovr_mid = LC_MID_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
+        if ovr_cl != 0 && ovr_mid != 0 {
+            true
+        } else {
+            matches!(REFLECT_IDS.get(), Some(r) if !r.app_classloader.is_null() && !r.load_class_mid.is_null())
+        }
+    };
 
-    // Try FindClass with '/' notation
+    if has_classloader {
+        // ClassLoader 已就绪 → 优先使用 loadClass 避免 WalkStack
+        let result = find_class_via_classloader(env, class_name);
+        if !result.is_null() {
+            return result;
+        }
+    }
+
+    // Fallback: ClassLoader 未初始化（bootstrap 阶段）或 loadClass 失败 → 使用 JNI FindClass
+    let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
     let jni_name = class_name.replace('.', "/");
     let c_name = match CString::new(jni_name) {
         Ok(c) => c,
         Err(_) => return std::ptr::null_mut(),
     };
-
     let cls = find_class(env, c_name.as_ptr());
     if !cls.is_null() && !jni_check_exc(env) {
         return cls;
     }
-    // FindClass failed — clear exception and try ClassLoader.loadClass
     jni_check_exc(env);
+    std::ptr::null_mut()
+}
 
-    // 优先使用 CL_OVERRIDE（Java.ready gate 设置），fallback 到 REFLECT_IDS 初始化阶段捕获的值
+/// 通过 ClassLoader.loadClass 查找类（不触发 WalkStack）
+unsafe fn find_class_via_classloader(env: JniEnv, class_name: &str) -> *mut std::ffi::c_void {
     let (app_cl, lc_mid) = {
         let ovr_cl = CL_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
         let ovr_mid = LC_MID_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);

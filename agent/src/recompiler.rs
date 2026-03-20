@@ -49,6 +49,7 @@ extern "C" {
     ) -> i32;
 
     fn hook_flush_cache(start: *mut libc::c_void, size: usize);
+    fn hook_write_jump(dst: *mut libc::c_void, target: *mut libc::c_void) -> i32;
 }
 
 /// C 侧的 RecompileStats 对应结构
@@ -364,6 +365,144 @@ pub fn patch_insns(addr: usize, insns: &[u32]) -> Result<()> {
     Ok(())
 }
 
+/// 在 recomp 页的跳板区分配 slot 并写入跳转，在代码页写 B 指令。
+///
+/// 保持 recomp 页 offset 一一对应：代码页只改 1 条指令（B tramp_slot），
+/// 完整跳转（ADRP+ADD+BR 或 MOVZ+MOVK+BR）写在跳板区。
+///
+/// `orig_addr`: 原始代码地址（自动翻译到 recomp 页偏移）
+/// `jump_dest`: 跳转目标（如 router thunk）
+/// 返回 recomp 页内被 patch 的地址（供调用方记录）
+pub fn patch_with_trampoline(orig_addr: usize, jump_dest: usize) -> Result<usize> {
+    ensure_init();
+
+    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let orig_base = orig_addr & !(page_size - 1);
+    let offset = orig_addr - orig_base;
+
+    let mut guard = RECOMP_PAGES.lock().unwrap();
+    let pages = guard.as_mut().unwrap();
+
+    let page = pages
+        .get_mut(&orig_base)
+        .ok_or_else(|| format!("页 0x{:x} 未重编译", orig_base))?;
+
+    // 跳板区在 recomp 页之后 (recomp_ptr + PAGE_SIZE)
+    let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
+    let tramp_cap = TRAMPOLINE_PAGES * PAGE_SIZE;
+    let slot_size = 20usize; // ADRP+ADD+BR (12) 或 MOVZ+MOVK+BR (16)，留 20 足够
+    if page.tramp_used + slot_size > tramp_cap {
+        return Err("recomp 跳板区已满".into());
+    }
+
+    let slot_ptr = unsafe { tramp_base.add(page.tramp_used) };
+    let slot_addr = slot_ptr as usize;
+
+    unsafe {
+        // 临时加写权限
+        mprotect(
+            page.recomp_ptr as *mut _,
+            page.recomp_total_size,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+        );
+
+        // 1. 在跳板 slot 写 full jump → jump_dest
+        let jump_len = hook_write_jump(slot_ptr as *mut _, jump_dest as *mut _);
+        if jump_len <= 0 {
+            mprotect(page.recomp_ptr as *mut _, page.recomp_total_size, PROT_READ | PROT_EXEC);
+            return Err(format!("hook_write_jump failed: {}", jump_len));
+        }
+
+        // 2. 在 recomp 代码页写 B slot（ARM64 B imm26: ±128MB）
+        let recomp_code_addr = page.recomp_ptr.add(offset) as usize;
+        let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
+        if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
+            mprotect(page.recomp_ptr as *mut _, page.recomp_total_size, PROT_READ | PROT_EXEC);
+            return Err(format!("B 指令范围超限: offset={}", b_offset));
+        }
+        let b_imm26 = ((b_offset >> 2) & 0x3FF_FFFF) as u32;
+        let b_insn: u32 = 0x14000000 | b_imm26;
+        ptr::write_volatile(recomp_code_addr as *mut u32, b_insn);
+
+        // 刷新 icache
+        hook_flush_cache(slot_ptr as *mut _, jump_len as usize);
+        hook_flush_cache(recomp_code_addr as *mut _, 4);
+
+        // 恢复权限
+        mprotect(
+            page.recomp_ptr as *mut _,
+            page.recomp_total_size,
+            PROT_READ | PROT_EXEC,
+        );
+    }
+
+    page.tramp_used += slot_size;
+    Ok(unsafe { page.recomp_ptr.add(offset) as usize })
+}
+
+/// 在 recomp 跳板区分配 slot，在 recomp 代码页写 B 指令指向 slot。
+/// 返回 slot 地址（hook engine 后续在 slot 上写 full jump→thunk）。
+///
+/// 调用链: recomp 代码页[offset] → B slot → (hook engine 写) full jump → thunk
+pub fn alloc_trampoline_slot(orig_addr: usize) -> Result<usize> {
+    ensure_init();
+
+    let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
+    let orig_base = orig_addr & !(page_size - 1);
+    let offset = orig_addr - orig_base;
+
+    let mut guard = RECOMP_PAGES.lock().unwrap();
+    let pages = guard.as_mut().unwrap();
+
+    let page = pages
+        .get_mut(&orig_base)
+        .ok_or_else(|| format!("页 0x{:x} 未重编译", orig_base))?;
+
+    // 跳板区在 recomp 页之后
+    let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
+    let tramp_cap = TRAMPOLINE_PAGES * PAGE_SIZE;
+    let slot_size = 32usize; // 预留足够空间给 hook engine 写 full jump + trampoline
+    if page.tramp_used + slot_size > tramp_cap {
+        return Err("recomp 跳板区已满".into());
+    }
+
+    let slot_ptr = unsafe { tramp_base.add(page.tramp_used) };
+    let slot_addr = slot_ptr as usize;
+    let recomp_code_addr = unsafe { page.recomp_ptr.add(offset) as usize };
+
+    // B 指令范围检查 (±128MB)
+    let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
+    if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
+        return Err(format!("B 指令范围超限: offset={}", b_offset));
+    }
+
+    unsafe {
+        // 临时加写权限
+        mprotect(
+            page.recomp_ptr as *mut _,
+            page.recomp_total_size,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+        );
+
+        // 在 recomp 代码页写 B slot
+        let b_imm26 = ((b_offset >> 2) & 0x3FF_FFFF) as u32;
+        let b_insn: u32 = 0x14000000 | b_imm26;
+        ptr::write_volatile(recomp_code_addr as *mut u32, b_insn);
+
+        hook_flush_cache(recomp_code_addr as *mut _, 4);
+
+        // 恢复权限
+        mprotect(
+            page.recomp_ptr as *mut _,
+            page.recomp_total_size,
+            PROT_READ | PROT_EXEC,
+        );
+    }
+
+    page.tramp_used += slot_size;
+    Ok(slot_addr)
+}
+
 /// 临时重编译结果（mmap 分配 + C 重编译，不注册 prctl）
 struct TempRecomp {
     orig_code: Vec<u8>,
@@ -387,8 +526,10 @@ fn do_recompile_temp(orig_base: usize) -> Result<TempRecomp> {
     }
 
     let total_size = PAGE_SIZE + TRAMPOLINE_PAGES * PAGE_SIZE;
+    // hint 靠近原始页，确保 B 指令（±128MB）和 ADRP（±4GB）都在范围内
+    let hint = (orig_base + PAGE_SIZE) as *mut libc::c_void;
     let recomp_ptr = unsafe {
-        mmap(ptr::null_mut(), total_size,
+        mmap(hint, total_size,
              PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
     };
     if recomp_ptr == libc::MAP_FAILED {

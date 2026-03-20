@@ -212,6 +212,7 @@ pub(super) unsafe fn install_per_method_router_hook(
     art_method: u64,
 ) -> Result<Option<u64>, String> {
     if has_independent_code {
+        // Layer 3: inline hook quickCode 作为快速路径 (直接调用场景)
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
         let (hook_addr, sflag) = prepare_hook_target(
             original_entry_point as u64, env as *mut std::ffi::c_void)
@@ -229,6 +230,7 @@ pub(super) unsafe fn install_per_method_router_hook(
             return Err("hook_install_art_router failed".to_string());
         }
 
+        // clone 的 entry_point 指向 trampoline (callOriginal 用)
         std::ptr::write_volatile((clone_addr as usize + ep_offset) as *mut u64, trampoline as u64);
         hook_ffi::hook_flush_cache((clone_addr as usize + ep_offset) as *mut std::ffi::c_void, 8);
 
@@ -237,22 +239,42 @@ pub(super) unsafe fn install_per_method_router_hook(
         } else {
             original_entry_point
         };
+
+        // 诊断: 验证 inline hook 的 patch 是否真正写入
+        let current_ep = std::ptr::read_volatile((art_method as usize + ep_offset) as *const u64);
+        let hooked_bytes: [u8; 4] = std::ptr::read(actual_hook_target as *const [u8; 4]);
         output_message(&format!(
-            "[java hook] Step 9: Layer 3 installed: ep={:#x} (hooked={:#x}), trampoline={:#x}",
-            original_entry_point, actual_hook_target, trampoline as u64
+            "[java hook] Step 9: Layer 3 installed: ep={:#x} (hooked={:#x}), trampoline={:#x}, current_ep={:#x}, first_bytes={:02x}{:02x}{:02x}{:02x}",
+            original_entry_point, actual_hook_target, trampoline as u64,
+            current_ep,
+            hooked_bytes[0], hooked_bytes[1], hooked_bytes[2], hooked_bytes[3]
         ));
+
         Ok(Some(actual_hook_target))
     } else {
-        if bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point {
-            let interp_bridge = bridge.quick_to_interpreter_bridge;
-            if interp_bridge != 0 {
-                std::ptr::write_volatile((art_method as usize + ep_offset) as *mut u64, interp_bridge);
-                hook_ffi::hook_flush_cache((art_method as usize + ep_offset) as *mut std::ffi::c_void, 8);
-                output_message(&format!(
-                    "[java hook] Step 9: nterp 降级: ep {:#x} → interpreter_bridge {:#x}",
-                    original_entry_point, interp_bridge
-                ));
-            }
+        // 非 compiled 方法: entry_point 是共享 stub (nterp/interpreter_bridge/resolution)
+        // 如果 entry_point 不是 Layer 1 已 hook 的 interpreter_bridge/resolution_trampoline,
+        // 则降级为 interpreter_bridge (确保走 Layer 1 拦截).
+        // 对标 Frida: nterp → quick_to_interpreter_bridge 降级.
+        let interp_bridge = bridge.quick_to_interpreter_bridge;
+        let resolved_interp = bridge.resolved_interpreter_bridge_entrypoint;
+        let resolved_res = bridge.resolved_resolution_entrypoint;
+
+        let is_already_routed =
+            original_entry_point == bridge.quick_to_interpreter_bridge
+            || original_entry_point == bridge.quick_resolution_trampoline
+            || (resolved_interp != 0 && original_entry_point == resolved_interp)
+            || (resolved_res != 0 && original_entry_point == resolved_res);
+
+        if !is_already_routed && interp_bridge != 0 {
+            // DeoptimizeBootImage + forced_interpret_only 已确保方法走 interpreter → DoCall (Layer 2)
+            // 不需要强制改 ep 为 interpreter_bridge — 保留 ART 设置的 ep（可能是 nterp 或
+            // deopt bridge），让 Layer 2 DoCall 拦截。强制改 ep 在 spawn 模式下可能导致
+            // WalkStack 异常（entry_point 与 OAT 元数据不匹配）。
+            output_message(&format!(
+                "[java hook] Step 9: 非 Layer 1 路由 ep={:#x}, 依赖 Layer 2 DoCall 拦截",
+                original_entry_point
+            ));
         } else {
             output_message(&format!(
                 "[java hook] Step 9: 共享 stub, 依赖 Layer 1+2 路由: ep={:#x}",

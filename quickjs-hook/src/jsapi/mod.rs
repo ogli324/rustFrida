@@ -13,6 +13,7 @@ pub(crate) mod util;
 pub use console::register_console;
 pub use hook_api::register_hook_api;
 pub use java::register_java_api;
+pub use java::deferred_java_init;
 pub use jni::register_jni_api;
 pub use memory::register_memory_api;
 pub use module::register_module_api;

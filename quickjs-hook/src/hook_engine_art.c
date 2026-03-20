@@ -15,6 +15,9 @@ ArtRouterEntry g_art_router_table[ART_ROUTER_TABLE_MAX];
 /* Debug: last X0 seen in not_found path + miss counter */
 volatile uint64_t g_art_router_last_x0 = 0;
 volatile uint64_t g_art_router_miss_count = 0;
+/* Debug: hit counter for found path */
+volatile uint64_t g_art_router_hit_count = 0;
+volatile uint64_t g_art_router_last_hit_x0 = 0;
 
 /* ============================================================================
  * ART router table management
@@ -117,6 +120,13 @@ void hook_art_router_get_debug(uint64_t* last_x0, uint64_t* miss_count) {
 void hook_art_router_reset_debug(void) {
     g_art_router_last_x0 = 0;
     g_art_router_miss_count = 0;
+    g_art_router_hit_count = 0;
+    g_art_router_last_hit_x0 = 0;
+}
+
+void hook_art_router_get_hit_debug(uint64_t* hit_count, uint64_t* last_hit_x0) {
+    if (hit_count)    *hit_count    = g_art_router_hit_count;
+    if (last_hit_x0)  *last_hit_x0  = g_art_router_last_hit_x0;
 }
 
 /* ============================================================================
@@ -124,14 +134,37 @@ void hook_art_router_reset_debug(void) {
  * and hook_create_art_router_stub.
  * ============================================================================ */
 
-/* Save X16/X17 to stack, save d0-d7, load g_art_router_table into X16 */
+/* 对标 Frida ARM64 trampoline: 保存全部 FPR + GPR + x0
+ * 总栈帧: FPR(64) + GPR(144) + x0(16) = 224 bytes
+ * Save order (Frida android.js:3425-3444):
+ *   d0-d7 (FP regs, 64 bytes)
+ *   x1-x7, x20-x28, x29, lr (GPR 18 regs = 144 bytes)
+ *   x0 (ArtMethod*, 16 bytes aligned)
+ */
+#define ROUTER_FRAME_FP_OFF  160  /* GPR(144) + x0(16) */
+#define ROUTER_FRAME_GPR_OFF  16  /* x0(16) */
+#define ROUTER_FRAME_SIZE    224  /* 64 + 144 + 16 */
+
 static void emit_art_router_prologue(Arm64Writer* w) {
-    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17,
-                                             ARM64_REG_SP, -16, ARM64_INDEX_PRE_ADJUST);
-    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 64);
+    /* 分配整个帧 */
+    arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
+    /* FPR: d0-d7 at SP+160 */
     for (int i = 0; i < 8; i += 2) {
-        arm64_writer_put_fp_stp_offset(w, i, i + 1, ARM64_REG_SP, i * 8);
+        arm64_writer_put_fp_stp_offset(w, i, i + 1, ARM64_REG_SP, ROUTER_FRAME_FP_OFF + i * 8);
     }
+    /* GPR at SP+16: x1,x2 / x3,x4 / x5,x6 / x7,x20 / x21,x22 / x23,x24 / x25,x26 / x27,x28 / x29,lr */
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X1,  ARM64_REG_X2,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 0,   ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X3,  ARM64_REG_X4,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 16,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X5,  ARM64_REG_X6,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 32,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X7,  ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 48,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 64,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 80,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 96,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 112, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_stp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_LR,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 128, ARM64_INDEX_SIGNED_OFFSET);
+    /* x0 at SP+0 */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    /* Load table pointer for scan */
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, (uint64_t)g_art_router_table);
 }
 
@@ -156,12 +189,26 @@ static void emit_art_router_scan_loop(Arm64Writer* w,
     *lbl_not_found_out = lbl_not_found;
 }
 
-/* Restore d0-d7 + deallocate 64-byte FP stack space */
-static void emit_art_router_restore_fp(Arm64Writer* w) {
+/* 对标 Frida: 恢复全部寄存器 (prologue 的逆序，使用固定偏移) */
+static void emit_art_router_restore_all(Arm64Writer* w) {
+    /* x0 at SP+0 */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
+    /* GPR at SP+16 */
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X1,  ARM64_REG_X2,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 0,   ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X3,  ARM64_REG_X4,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 16,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X5,  ARM64_REG_X6,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 32,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X7,  ARM64_REG_X20, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 48,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X21, ARM64_REG_X22, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 64,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X23, ARM64_REG_X24, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 80,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X25, ARM64_REG_X26, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 96,  ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X27, ARM64_REG_X28, ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 112, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X29, ARM64_REG_LR,  ARM64_REG_SP, ROUTER_FRAME_GPR_OFF + 128, ARM64_INDEX_SIGNED_OFFSET);
+    /* FPR at SP+160 */
     for (int i = 0; i < 8; i += 2) {
-        arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP, i * 8);
+        arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP, ROUTER_FRAME_FP_OFF + i * 8);
     }
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 64);
+    /* 释放帧 */
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, ROUTER_FRAME_SIZE);
 }
 
 /* Debug: store X0 to g_art_router_last_x0, increment g_art_router_miss_count */
@@ -174,44 +221,44 @@ static void emit_art_router_debug_counters(Arm64Writer* w) {
     arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 0);
 }
 
-/* Found path: load replacement into X0, sync declaring_class_ from original,
- * load quickCode, restore d0-d7, discard saved X16/X17, BR X17 to replacement.quickCode.
+/* Found path: load replacement into X0, load quickCode, restore d0-d7,
+ * discard saved X16/X17, BR X17 to replacement.quickCode.
  *
- * declaring_class_ sync: GC updates the original ArtMethod's declaring_class_
- * (offset 0, 4-byte GcRoot) but our heap-allocated replacement is NOT tracked
- * by the GC.  Copying it inline here eliminates the race window between GC
- * moving the class object and our on_gc_sync_leave callback. */
+ * 对标 Frida: declaring_class_ 不在 trampoline 里同步。
+ * Frida 的 find_replacement_method_from_quick_code 是纯读操作，
+ * declaring_class_ 仅通过 GC 回调 (synchronize_replacement_methods) 批量同步。
+ * 在 trampoline 里写 malloc 地址会导致 Scudo 堆损坏（spawn 模式已验证）。 */
 static void emit_art_router_found_path(Arm64Writer* w, uint64_t lbl_found,
                                         uint32_t quickcode_offset) {
     arm64_writer_put_label(w, lbl_found);
-    /* At this point: X17 = original ArtMethod* (from scan), X16 = &table[i] */
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X16, 8);   /* X0 = replacement */
-    /* Sync declaring_class_ (4 bytes at offset 0): original → replacement.
-     * X17 still holds the original ArtMethod*; W16 is free after loading replacement. */
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_W16, ARM64_REG_X17, 0);  /* W16 = original.declaring_class_ */
-    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_W16, ARM64_REG_X0, 0);   /* replacement.declaring_class_ = W16 */
-    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X0, (int64_t)quickcode_offset);
-    emit_art_router_restore_fp(w);
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 16);
-    arm64_writer_put_br_reg(w, ARM64_REG_X17);
+    /* Debug: increment hit counter (X17=original, X16=&table[i]) */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X0, (uint64_t)&g_art_router_hit_count);
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X0, 0);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_X17, ARM64_REG_X17, 1);
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X0, 0);
+
+    /* At this point: X16 = &table[i] */
+    /* 把 replacement 写入 saved x0 slot (对标 Frida: overwrite saved x0 with replacement) */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X16, 8);  /* X17 = replacement */
+    arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_SP, 0);   /* saved_x0 = replacement */
+    /* 加载 replacement.quickCode 到 X16 (恢复寄存器后跳转) */
+    arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, (int64_t)quickcode_offset);
+    /* 恢复全部寄存器 (x0 从 saved slot 读取 = replacement ArtMethod*) */
+    emit_art_router_restore_all(w);
+    arm64_writer_put_br_reg(w, ARM64_REG_X16);
 }
 
-/* Not-found path: label → debug counters → restore FP → restore X16/X17 →
- * load fallback target into X17 → BR X17.
+/* Not-found path: 对标 Frida — 恢复全部寄存器 → relocated original instructions → jump back.
  * Shared by generate_art_router_thunk and hook_create_art_router_stub. */
 static void emit_art_router_not_found_path(Arm64Writer* w, uint64_t lbl_not_found,
                                             uint64_t fallback_target) {
     arm64_writer_put_label(w, lbl_not_found);
     emit_art_router_debug_counters(w);
-    emit_art_router_restore_fp(w);
-
-    /* Restore X16/X17 */
-    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17,
-                                             ARM64_REG_SP, 16, ARM64_INDEX_POST_ADJUST);
-
-    /* Jump to fallback target (X17 clobbered, but it's IPC scratch) */
-    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, fallback_target);
-    arm64_writer_put_br_reg(w, ARM64_REG_X17);
+    /* 恢复全部寄存器（包括原始 x0） */
+    emit_art_router_restore_all(w);
+    /* Jump to fallback target (relocated original or trampoline) */
+    arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, fallback_target);
+    arm64_writer_put_br_reg(w, ARM64_REG_X16);
 }
 
 /* ============================================================================
@@ -344,10 +391,15 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         return NULL;
     }
 
+    /* Recomp 模式: 只覆盖 4 字节 (B 指令)，保持 recomp 页 offset 对应 */
+    if (stealth == 2) {
+        entry->original_size = 4;
+    }
+
     /* Allocate thunk (router code — larger than default) */
     size_t art_thunk_alloc = 1024;
     if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
-        entry->thunk = hook_alloc(art_thunk_alloc);
+        entry->thunk = hook_alloc_near(art_thunk_alloc, target);
         entry->thunk_alloc = art_thunk_alloc;
     }
     if (!entry->thunk) {
@@ -372,8 +424,27 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
         return NULL;
     }
 
-    /* Patch target to jump to router thunk */
-    if (patch_target(target, entry->thunk, stealth, entry) != 0) {
+    /* Patch target to jump to router thunk.
+     * stealth==2 (recomp): B 指令只能跳 ±128MB，thunk 可能更远。
+     * 分配中间 slot（靠近 target），slot 里放 full jump 到 thunk。 */
+    void* patch_dest = entry->thunk;
+    if (stealth == 2) {
+        void* slot = hook_alloc_near(32, target);
+        if (!slot) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
+            return NULL;
+        }
+        int jlen = hook_write_jump(slot, entry->thunk);
+        if (jlen < 0) {
+            free_entry(entry);
+            pthread_mutex_unlock(&g_engine.lock);
+            return NULL;
+        }
+        hook_flush_cache(slot, jlen);
+        patch_dest = slot;
+    }
+    if (patch_target(target, patch_dest, stealth, entry) != 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
@@ -407,7 +478,7 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
     pthread_mutex_lock(&g_engine.lock);
 
     size_t stub_alloc = 1024;
-    void* stub_mem = hook_alloc(stub_alloc);
+    void* stub_mem = hook_alloc_near(stub_alloc, (void*)(uintptr_t)fallback_target);
     if (!stub_mem) {
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
@@ -437,4 +508,35 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
              stub_mem, (unsigned long long)fallback_target, stub_size);
 
     return stub_mem;
+}
+
+/* ============================================================================
+ * C-side GC synchronization — 对标 Frida synchronize_replacement_methods
+ *
+ * 遍历 g_art_router_table，对每个 original/replacement 对:
+ * 1. 复制 declaring_class_ (offset 0, 4B) from original → replacement
+ * 2. 如果 original.quickCode == nterp → 降级为 interpreter_bridge
+ * ============================================================================ */
+void hook_art_synchronize_replacement_methods(
+    uint32_t quickcode_offset,
+    uint64_t nterp_entrypoint,
+    uint64_t interp_bridge) {
+    for (int i = 0; i < ART_ROUTER_TABLE_MAX; i++) {
+        uint64_t original = g_art_router_table[i].original;
+        uint64_t replacement = g_art_router_table[i].replacement;
+        if (original == 0) break;
+        if (replacement == 0) continue;
+
+        /* 1. declaring_class_ 同步 */
+        uint32_t declaring_class = *(volatile uint32_t*)(uintptr_t)original;
+        *(volatile uint32_t*)(uintptr_t)replacement = declaring_class;
+
+        /* 2. nterp → interpreter_bridge 降级 */
+        if (nterp_entrypoint != 0 && quickcode_offset != 0) {
+            volatile uint64_t* ep = (volatile uint64_t*)((uintptr_t)original + quickcode_offset);
+            if (*ep == nterp_entrypoint && interp_bridge != 0) {
+                *ep = interp_bridge;
+            }
+        }
+    }
 }

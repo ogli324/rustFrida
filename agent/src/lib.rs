@@ -240,8 +240,23 @@ fn process_cmd(command: &str) {
             stalker::hfollow(md, offset)
         }
         #[cfg(feature = "quickjs")]
+        Some("artinit") => {
+            // 预初始化 artController Layer 1+2 (spawn 模式, 进程暂停时调用)
+            match quickjs_hook::jsapi::java::pre_init_art_controller() {
+                Ok(_) => send_eval_ok("artinit_ok"),
+                Err(e) => send_eval_err(&format!("artinit failed: {}", e)),
+            }
+        }
+        #[cfg(feature = "quickjs")]
         Some("jsinit") => match quickjs_loader::init() {
             Ok(_) => send_eval_ok("initialized"),
+            Err(e) => send_eval_err(&e),
+        },
+        // javainit: 延迟 JNI 初始化（spawn 模式 resume 后调用）
+        // AttachCurrentThread + cache reflect IDs
+        #[cfg(feature = "quickjs")]
+        Some("javainit") => match quickjs_hook::deferred_java_init() {
+            Ok(_) => send_eval_ok("java_initialized"),
             Err(e) => send_eval_err(&e),
         },
         #[cfg(feature = "quickjs")]
@@ -327,6 +342,10 @@ fn process_cmd(command: &str) {
             if quickjs_loader::is_initialized() {
                 quickjs_loader::cleanup();
             }
+            // 关键: 在 agent SO 被 dlclose 之前恢复旧信号处理器，
+            // 否则 sigaction 表中的 handler 指针指向已卸载的内存，
+            // 进程触发任何信号(如 ART 隐式 null check)即崩溃
+            crash_handler::uninstall_crash_handlers();
             log_msg("退出清理完成，准备关闭 socket\n".to_string());
             SHOULD_EXIT.store(true, Ordering::Relaxed);
         }
