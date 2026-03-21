@@ -40,7 +40,7 @@ int page_has_read_perm(uintptr_t addr) {
  *
  * Strategy:
  *   1. Check VMA permission — if readable, direct memcpy.
- *   2. Otherwise mprotect to add read bit, memcpy, then restore.
+ *   2. Otherwise read via /proc/self/mem (no permission change).
  *
  * Returns 0 on success, -1 on failure.
  */
@@ -51,16 +51,21 @@ int read_target_safe(void* target, void* buf, size_t len) {
         return 0;
     }
 
-    /* Page not readable (XOM / --x) — mprotect to add read, then memcpy */
-    uintptr_t page_start = (uintptr_t)target & ~(uintptr_t)0xFFF;
-    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC) == 0) {
-        memcpy(buf, target, len);
-        /* restore to original r-x (mprotect already set it to r-x) */
-        return 0;
+    /* Page not readable (XOM / --x) — use /proc/self/mem to bypass.
+     * mprotect would permanently change --x to r-x in /proc/self/maps,
+     * detectable by hunter scanning libart permission bits. */
+    int fd = open("/proc/self/mem", O_RDONLY);
+    if (fd < 0) {
+        hook_log("read_target_safe: open /proc/self/mem failed errno=%d", errno);
+        return -1;
     }
-
-    hook_log("read_target_safe: mprotect failed errno=%d", errno);
-    return -1;
+    ssize_t n = pread(fd, buf, len, (off_t)(uintptr_t)target);
+    close(fd);
+    if (n != (ssize_t)len) {
+        hook_log("read_target_safe: pread failed n=%zd errno=%d", n, errno);
+        return -1;
+    }
+    return 0;
 }
 
 /* --- Pool permission management --- */
@@ -122,8 +127,6 @@ void hook_flush_cache(void* start, size_t size) {
 
 /*
  * Find the VMA containing addr by parsing /proc/self/maps.
- * Returns the VMA start in *vma_start and size in *vma_size.
- * Only matches VMAs with the given permission prefix (e.g., "r-x").
  * Returns 0 on success, -1 if not found.
  */
 static int find_containing_vma(uintptr_t addr, uintptr_t* vma_start, size_t* vma_size) {
@@ -149,14 +152,14 @@ static int find_containing_vma(uintptr_t addr, uintptr_t* vma_start, size_t* vma
 }
 
 /*
- * Split a PMD (2MB section) mapping into PTE-level pages without
- * causing a VMA split in /proc/self/maps.
+ * Split PMD block / contiguous PTE group by mprotect on the ENTIRE
+ * containing VMA + COW write.  Operating on the full VMA boundary
+ * avoids VMA fragmentation in /proc/self/maps.
  *
- * Strategy: mprotect the ENTIRE containing VMA to rwx, write one byte
- * (triggers COW on the target page, splitting the PMD at kernel level),
- * then restore the entire VMA to its original permissions.  Because we
- * operate on the full VMA boundary, the kernel never splits the VMA
- * into sub-regions — the VMA count in /proc/self/maps stays the same.
+ * The transient RWX window is unavoidable but:
+ *   - wxshadow itself causes VMA splits (more detectable than RWX)
+ *   - The window is microseconds (single volatile write)
+ *   - Without this, wxshadow fails on contiguous PTE pages
  *
  * Returns 0 on success, -1 on failure.
  */
@@ -169,9 +172,6 @@ static int pmd_split_cow(void* addr) {
         return -1;
     }
 
-    hook_log("pmd_split_cow: VMA=%p-%p (size=%zu) for addr=%p",
-             (void*)vma_start, (void*)(vma_start + vma_size), vma_size, addr);
-
     /* mprotect the entire VMA to rwx — no VMA split */
     if (mprotect((void*)vma_start, vma_size,
                  PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
@@ -179,13 +179,16 @@ static int pmd_split_cow(void* addr) {
         return -1;
     }
 
-    /* Write original byte back to trigger COW on the target page.
-     * This creates a private anonymous page, splitting the PMD. */
+    /* Write original byte back to trigger COW + split contiguous PTE group.
+     * The write fault handler splits PMD block entries AND clears the
+     * contiguous bit on ARM64 PTE groups before creating the COW copy. */
     *(volatile uint8_t*)addr = *(volatile uint8_t*)addr;
 
     /* Restore entire VMA to r-x — no VMA split */
     mprotect((void*)vma_start, vma_size, PROT_READ | PROT_EXEC);
 
+    hook_log("pmd_split_cow: COW triggered for addr=%p (VMA=%p-%p)",
+             addr, (void*)vma_start, (void*)(vma_start + vma_size));
     return 0;
 }
 
@@ -301,18 +304,24 @@ int write_jump_back(void* dst, void* target, uint32_t written_regs) {
     return finalize_jump_writer(&w);
 }
 
-/* Write a jump to target. 优先 ADRP+ADD+BR (12B, wxshadow 安全, 需 ±4GB),
- * fallback 到 MOVZ+MOVK+BR (16B, 无限制)。对标 Frida 的近距离优先策略。 */
-int hook_write_jump(void* dst, void* target) {
+/* Write a jump to target at the given execution PC.
+ * 优先 ADRP+ADD+BR (12B, wxshadow 安全, 需 ±4GB),
+ * fallback 到 MOVZ+MOVK+BR (16B, 无限制)。
+ *
+ * exec_pc: the address where this code will actually execute.
+ *   - For direct patching (stealth=0): exec_pc == dst
+ *   - For wxshadow (stealth=1): exec_pc == hook target addr (not the tmp buffer)
+ *   This ensures ADRP offsets are correct for the actual execution context. */
+int hook_write_jump_at(void* dst, uint64_t exec_pc, void* target) {
     if (!dst || !target) {
         return HOOK_ERROR_INVALID_PARAM;
     }
 
     Arm64Writer w;
-    arm64_writer_init(&w, dst, (uint64_t)dst, MIN_HOOK_SIZE);
+    arm64_writer_init(&w, dst, exec_pc, MIN_HOOK_SIZE);
 
     /* 尝试 ADRP+ADD+BR (12 字节, ±4GB) */
-    int64_t pc_rel = (int64_t)(uint64_t)target - (int64_t)(uint64_t)dst;
+    int64_t pc_rel = (int64_t)(uint64_t)target - (int64_t)exec_pc;
     int64_t adrp_range = (int64_t)1 << 32; /* ±4GB */
     if (pc_rel > -adrp_range && pc_rel < adrp_range) {
         arm64_writer_put_adrp_add_br(&w, ARM64_REG_X16, (uint64_t)target);
@@ -333,6 +342,11 @@ int hook_write_jump(void* dst, void* target) {
     return bytes_written;
 }
 
+/* Backward-compatible wrapper: exec_pc == dst (for direct patching). */
+int hook_write_jump(void* dst, void* target) {
+    return hook_write_jump_at(dst, (uint64_t)dst, target);
+}
+
 /* Allocate from executable memory pool */
 /* 从指定 pool 分配 */
 static void* alloc_from_pool(ExecPool* pool, size_t size) {
@@ -342,18 +356,142 @@ static void* alloc_from_pool(ExecPool* pool, size_t size) {
     return ptr;
 }
 
-/* 创建新 pool（mmap near hint）。
- * 如果 mmap 结果不在 hint 的 ADRP 范围内，仍保留 pool（供通用分配用）。 */
-static ExecPool* create_pool_near(void* hint) {
-    if (g_engine.pool_count >= MAX_EXEC_POOLS) {
-        return NULL;  /* 静默失败，调用方会 fallback 到 hook_alloc */
+/* 扫描 /proc/self/maps 找 target ±4GB 范围内的空隙，mmap RWX 内存。
+ * 公共函数: Rust 侧初始 pool 和 C 侧动态 pool 共用此逻辑。
+ * target=NULL 时退化为普通 mmap(NULL)。
+ * 返回 mmap 得到的指针，MAP_FAILED 表示失败。 */
+void* hook_mmap_near(void* target, size_t alloc_size) {
+    if (!target) {
+        return mmap(NULL, alloc_size,
+                    PROT_READ | PROT_WRITE | PROT_EXEC,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     }
-    void* ptr = mmap(hint, EXEC_POOL_SIZE,
-                     PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (ptr == MAP_FAILED) {
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+
+    int64_t adrp_range = (int64_t)1 << 32;
+    uintptr_t target_addr = (uintptr_t)target;
+
+    /* 搜索区间 [search_lo, search_hi) */
+    uintptr_t search_lo = 0;
+    if (target_addr > (uintptr_t)adrp_range)
+        search_lo = (target_addr - (uintptr_t)adrp_range + page_size - 1) & ~(page_size - 1);
+    else
+        search_lo = (uintptr_t)page_size;
+    uintptr_t search_hi = target_addr + (uintptr_t)adrp_range;
+    if (search_hi < target_addr) search_hi = UINTPTR_MAX;
+
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) {
+        hook_log("hook_mmap_near: failed to open /proc/self/maps");
+        return MAP_FAILED;
+    }
+
+    #define MAX_CANDIDATES 32
+    struct { uintptr_t addr; int64_t dist; } candidates[MAX_CANDIDATES];
+    int num_candidates = 0;
+
+    char line[512];
+    uintptr_t prev_end = 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t vma_start = 0, vma_end = 0;
+        if (sscanf(line, "%lx-%lx", &vma_start, &vma_end) < 2) continue;
+
+        if (prev_end > 0 && vma_start > prev_end) {
+            uintptr_t gap_start = prev_end;
+            uintptr_t gap_end = vma_start;
+
+            if (gap_start < search_hi && gap_end > search_lo) {
+                if (gap_start < search_lo) gap_start = search_lo;
+                if (gap_end > search_hi) gap_end = search_hi;
+                gap_start = (gap_start + page_size - 1) & ~(page_size - 1);
+
+                if (gap_end > gap_start && (gap_end - gap_start) >= alloc_size) {
+                    uintptr_t candidate;
+                    if (target_addr >= gap_start && target_addr < gap_end) {
+                        candidate = target_addr & ~(page_size - 1);
+                        if (candidate < gap_start) candidate = gap_start;
+                    } else if (target_addr < gap_start) {
+                        candidate = gap_start;
+                    } else {
+                        candidate = (gap_end - alloc_size) & ~(page_size - 1);
+                        if (candidate < gap_start) candidate = gap_start;
+                    }
+
+                    if (candidate + alloc_size <= gap_end && num_candidates < MAX_CANDIDATES) {
+                        int64_t d = (int64_t)(candidate - target_addr);
+                        if (d < 0) d = -d;
+                        candidates[num_candidates].addr = candidate;
+                        candidates[num_candidates].dist = d;
+                        num_candidates++;
+                    }
+                }
+            }
+        }
+        prev_end = vma_end;
+    }
+    fclose(f);
+
+    /* 按距离排序 */
+    for (int i = 1; i < num_candidates; i++) {
+        __typeof__(candidates[0]) tmp = candidates[i];
+        int j = i - 1;
+        while (j >= 0 && candidates[j].dist > tmp.dist) {
+            candidates[j + 1] = candidates[j];
+            j--;
+        }
+        candidates[j + 1] = tmp;
+    }
+
+    int max_tries = num_candidates < 16 ? num_candidates : 16;
+
+    #ifndef MAP_FIXED_NOREPLACE
+    #define MAP_FIXED_NOREPLACE 0x100000
+    #endif
+
+    for (int i = 0; i < max_tries; i++) {
+        void* cand = (void*)candidates[i].addr;
+
+        void* ptr = mmap(cand, alloc_size,
+                         PROT_READ | PROT_WRITE | PROT_EXEC,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+
+        if (ptr == MAP_FAILED && (errno == ENOSYS || errno == EINVAL)) {
+            ptr = mmap(cand, alloc_size,
+                       PROT_READ | PROT_WRITE | PROT_EXEC,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (ptr != MAP_FAILED) {
+                int64_t d = (int64_t)((uint8_t*)ptr - (uint8_t*)target);
+                if (d < -adrp_range || d >= adrp_range) {
+                    munmap(ptr, alloc_size);
+                    ptr = MAP_FAILED;
+                }
+            }
+        }
+
+        if (ptr != MAP_FAILED) {
+            hook_log("hook_mmap_near: OK at %p for target %p", ptr, target);
+            return ptr;
+        }
+    }
+
+    hook_log("hook_mmap_near: all %d candidates failed for target %p", max_tries, target);
+    return MAP_FAILED;
+    #undef MAX_CANDIDATES
+}
+
+/* 创建新 pool（调用 hook_mmap_near 扫描空隙） */
+static ExecPool* create_pool_near(void* target) {
+    if (g_engine.pool_count >= MAX_EXEC_POOLS) {
+        hook_log("create_pool_near: pool count %d reached MAX_EXEC_POOLS", g_engine.pool_count);
         return NULL;
     }
+
+    void* ptr = hook_mmap_near(target, EXEC_POOL_SIZE);
+    if (ptr == MAP_FAILED) return NULL;
+
     ExecPool* pool = &g_engine.pools[g_engine.pool_count++];
     pool->base = ptr;
     pool->size = EXEC_POOL_SIZE;
@@ -361,12 +499,14 @@ static ExecPool* create_pool_near(void* hint) {
     return pool;
 }
 
+
 /* 判断 pool 是否在 target 的 ADRP 范围内 (±4GB) */
 static int pool_in_adrp_range(ExecPool* pool, void* target) {
     int64_t dist = (int64_t)((uint8_t*)pool->base - (uint8_t*)target);
     int64_t range = (int64_t)1 << 32;
     return dist > -range && dist < range;
 }
+
 
 void* hook_alloc(size_t size) {
     if (!g_engine.initialized) return NULL;
@@ -396,7 +536,7 @@ void* hook_alloc_near(size_t size, void* target) {
 
     int64_t adrp_range = (int64_t)1 << 32;
 
-    /* 1. 遍历所有 pool（含初始 pool），找 ADRP 可达 + 有空间的 */
+    /* Phase 1: 遍历所有 pool（含初始 pool），找 ADRP 可达 + 有空间的 */
     if (g_engine.exec_mem_used + size <= g_engine.exec_mem_size) {
         int64_t dist = (int64_t)((uint8_t*)g_engine.exec_mem - (uint8_t*)target);
         if (dist > -adrp_range && dist < adrp_range) {
@@ -412,23 +552,18 @@ void* hook_alloc_near(size_t size, void* target) {
         }
     }
 
-    /* 2. 没有 ADRP 可达的 pool → 尝试创建一个靠近 target 的。
-     *    但只在没有通用空间时才创建（避免浪费）。 */
-    void* fallback = hook_alloc(size);
-    if (fallback) {
-        /* 有通用空间可用，检查是否碰巧在 ADRP 范围内 */
-        int64_t dist = (int64_t)((uint8_t*)fallback - (uint8_t*)target);
-        if (dist > -adrp_range && dist < adrp_range) {
-            return fallback; /* 运气好，在 ADRP 范围 */
-        }
-        /* 不在 ADRP 范围，但 hook_write_jump 会用 MOVZ+MOVK 兜底 */
-        return fallback;
+    /* Phase 2: 创建 nearby pool（扫描 maps 空隙） */
+    ExecPool* near_pool = create_pool_near(target);
+    if (near_pool) {
+        void* ptr = alloc_from_pool(near_pool, size);
+        if (ptr) return ptr;
     }
 
-    /* 3. 通用分配也失败 → 创建新 pool */
-    ExecPool* new_pool = create_pool_near(target);
-    return new_pool ? alloc_from_pool(new_pool, size) : NULL;
+    /* Phase 3: nearby 失败 → 通用分配兜底（MOVZ+MOVK 路径） */
+    hook_log("hook_alloc_near: WARN nearby failed for target %p, fallback generic", target);
+    return hook_alloc(size);
 }
+
 
 /* --- Instruction relocation --- */
 
@@ -515,9 +650,10 @@ HookEntry* setup_hook_entry(void* target) {
 
     entry->target = target;
 
-    /* Allocate trampoline space near target (for ADRP range) */
+    /* trampoline 不需要 near: jump-back 用 MOVZ+MOVK 绝对跳转，
+     * thunk 也通过 MOVZ+MOVK 加载 trampoline 地址。节省 nearby pool 空间。 */
     if (!entry->trampoline || entry->trampoline_alloc < TRAMPOLINE_ALLOC_SIZE) {
-        entry->trampoline = hook_alloc_near(TRAMPOLINE_ALLOC_SIZE, target);
+        entry->trampoline = hook_alloc(TRAMPOLINE_ALLOC_SIZE);
         entry->trampoline_alloc = TRAMPOLINE_ALLOC_SIZE;
     }
     if (!entry->trampoline) {
@@ -583,9 +719,12 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
     }
 
     if (stealth == 1) {
-        /* wxshadow 模式: 一步写入 shadow 页 */
-        uint8_t jump_buf[MIN_HOOK_SIZE];
-        jump_result = hook_write_jump(jump_buf, jump_dest);
+        /* wxshadow 模式: 一步写入 shadow 页.
+         * 1. aligned(32) 防止 buf 跨页 (copy_from_user_via_pte 不支持跨页)
+         * 2. hook_write_jump_at 用 target 的 PC 算 ADRP，而非 buf 的栈地址，
+         *    使 target↔thunk 在 ±4GB 时走 ADRP+ADD+BR (12B) 而非 MOVZ (16B) */
+        uint8_t jump_buf[MIN_HOOK_SIZE] __attribute__((aligned(32)));
+        jump_result = hook_write_jump_at(jump_buf, (uint64_t)target, jump_dest);
         if (jump_result < 0) {
             return jump_result;
         }
@@ -594,13 +733,14 @@ int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
             entry->original_size = jump_result;
             return 0;
         }
-        hook_log("patch_target: wxshadow failed, falling back to mprotect");
+        /* stealth1 严格模式: wxshadow 失败拒绝降级到 mprotect。
+         * 降级会直接修改原始内存字节 + RWX 权限变更，
+         * hunter CRC 校验 / /proc/self/maps 扫描均可检测。 */
+        hook_log("\033[31m[STEALTH] wxshadow 失败 %p，拒绝降级 mprotect（hunter 防检测）\033[0m", target);
+        return HOOK_ERROR_WXSHADOW_FAILED;
     }
 
-    /* Normal mode (stealth=0) or wxshadow fallback: mprotect + direct write */
-    if (stealth != 0) {
-        hook_log("\033[31m[STEALTH 失效] mprotect 直接修改原始内存 %p，CRC 校验将检测到变化！\033[0m", target);
-    }
+    /* Normal mode (stealth=0): mprotect + direct write */
     uintptr_t page_start = (uintptr_t)target & ~0xFFF;
     if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
         return HOOK_ERROR_MPROTECT_FAILED;

@@ -156,8 +156,13 @@ void hook_engine_cleanup(void);
 void* hook_alloc(size_t size);
 
 /* Allocate from a pool near `target` (within ±4GB for ADRP).
- * Creates a new pool via mmap(hint) if no existing pool is in range. */
+ * Creates a new pool via maps gap scan if no existing pool is in range. */
 void* hook_alloc_near(size_t size, void* target);
+
+/* mmap RWX 内存，扫描 /proc/self/maps 在 target ±4GB 内找空隙。
+ * target=NULL 时退化为普通 mmap(NULL)。
+ * 返回 mmap 指针，MAP_FAILED 表示失败。调用方负责 munmap。 */
+void* hook_mmap_near(void* target, size_t alloc_size);
 
 /*
  * Relocate ARM64 instruction(s) to dst.

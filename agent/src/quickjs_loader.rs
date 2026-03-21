@@ -6,7 +6,8 @@
 #![cfg(feature = "quickjs")]
 
 use crate::vma_name::set_anon_vma_name_raw;
-use libc::{mmap, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, _SC_PAGESIZE};
+use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
+
 use quickjs_hook::{
     cleanup_engine, cleanup_hook_engine, cleanup_hooks, cleanup_java_hooks, complete_script, get_or_init_engine,
     init_hook_engine, load_script, set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
@@ -44,41 +45,30 @@ struct ExecMemory {
 }
 
 impl ExecMemory {
-    /// Allocate executable memory near `hint` address (for ADRP range).
-    /// Falls back to kernel-chosen address if hint fails.
+    /// 调用 C 侧 hook_mmap_near 扫描 maps 空隙分配 nearby RWX 内存。
+    /// hint=0 时退化为普通 mmap。
     fn new_near(size: usize, hint: usize) -> Option<Self> {
         let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
         let alloc_size = ((size + page_size - 1) / page_size) * page_size;
-        // 页对齐 hint
-        let hint_aligned = if hint != 0 { (hint + page_size) & !(page_size - 1) } else { 0 };
 
-        unsafe {
-            let ptr = mmap(
-                hint_aligned as *mut _,
-                alloc_size,
-                PROT_READ | PROT_WRITE | PROT_EXEC,
-                MAP_PRIVATE | MAP_ANONYMOUS,
-                -1,
-                0,
-            );
-
-            if ptr == libc::MAP_FAILED {
-                return None;
-            }
-
-            match set_anon_vma_name_raw(ptr as *mut u8, alloc_size, HOOK_EXEC_VMA_NAME) {
-                Ok(()) => log_msg("[vma] named hook pool as wwb_hook_exec\n".to_string()),
-                Err(errno) => log_msg(format!(
-                    "[vma] failed to name hook pool as wwb_hook_exec: errno={}\n",
-                    errno
-                )),
-            }
-
-            Some(ExecMemory {
-                ptr: ptr as *mut u8,
-                size: alloc_size,
-            })
+        extern "C" {
+            fn hook_mmap_near(target: *mut std::ffi::c_void, alloc_size: usize) -> *mut std::ffi::c_void;
         }
+
+        let ptr = unsafe {
+            hook_mmap_near(hint as *mut std::ffi::c_void, alloc_size)
+        };
+
+        if ptr == MAP_FAILED as *mut std::ffi::c_void {
+            return None;
+        }
+
+        match set_anon_vma_name_raw(ptr as *mut u8, alloc_size, HOOK_EXEC_VMA_NAME) {
+            Ok(()) => {}
+            Err(_) => {}
+        }
+
+        Some(ExecMemory { ptr: ptr as *mut u8, size: alloc_size })
     }
 
     fn new(size: usize) -> Option<Self> {

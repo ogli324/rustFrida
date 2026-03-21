@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
+#include <fcntl.h>
 
 /* wxshadow prctl operations - two-step shadow page patching:
  *   1. PATCH: create shadow + write data + activate (--x) in one step
@@ -69,6 +70,7 @@ void free_entry(HookEntry* entry);
 int wxshadow_patch(void* addr, const void* buf, size_t len);
 int wxshadow_release(void* addr);
 int write_jump_back(void* dst, void* target, uint32_t written_regs);
+int hook_write_jump_at(void* dst, uint64_t exec_pc, void* target);
 
 /* --- Core (hook_engine.c) --- */
 HookEntry* find_hook(void* target);

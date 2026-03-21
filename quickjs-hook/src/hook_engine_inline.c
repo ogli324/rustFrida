@@ -140,11 +140,11 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
                                     size_t* thunk_size_out) {
     void* thunk_mem;
 
-    /* Reuse thunk memory from free list entry if available and large enough */
+    /* attach thunk 需要 near: target → thunk 通过 inline patch 跳转（ADRP/B 有距离限制） */
     if (entry->thunk && entry->thunk_alloc >= THUNK_ALLOC_SIZE) {
         thunk_mem = entry->thunk;
     } else {
-        thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
+        thunk_mem = hook_alloc_near(THUNK_ALLOC_SIZE, entry->target);
         if (!thunk_mem) return NULL;
         entry->thunk = thunk_mem;
         entry->thunk_alloc = THUNK_ALLOC_SIZE;
@@ -273,11 +273,11 @@ static void* generate_replace_thunk(HookEntry* entry, HookCallback on_enter,
                                      void* user_data, size_t* thunk_size_out) {
     void* thunk_mem;
 
-    /* Reuse thunk memory from free list entry if available and large enough */
+    /* replace thunk 需要 near: target → thunk 通过 inline patch 跳转（ADRP/B 有距离限制） */
     if (entry->thunk && entry->thunk_alloc >= THUNK_ALLOC_SIZE) {
         thunk_mem = entry->thunk;
     } else {
-        thunk_mem = hook_alloc(THUNK_ALLOC_SIZE);
+        thunk_mem = hook_alloc_near(THUNK_ALLOC_SIZE, entry->target);
         if (!thunk_mem) return NULL;
         entry->thunk = thunk_mem;
         entry->thunk_alloc = THUNK_ALLOC_SIZE;

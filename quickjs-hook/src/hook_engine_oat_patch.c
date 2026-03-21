@@ -501,9 +501,10 @@ static int apply_oat_inline_patch(
      * LDR that was relocated to the trampoline), using Xscratch is safe. */
     Arm64Reg scratch_reg = (Arm64Reg)(ARM64_REG_X0 + scratch);
 
-    /* 复用通用 hook_write_jump（ADRP=12B 或 MOVZ=16B，不 pad BRK，wxshadow 安全）。 */
-    uint8_t redirect[MIN_HOOK_SIZE];
-    int jump_len = hook_write_jump(redirect, trampoline);
+    /* 用 hook_write_jump_at 以 patch_addr 的 PC 生成跳转（ADRP 优先）。
+     * aligned(32) 防止 buf 跨页 (wxshadow copy_from_user_via_pte 限制)。 */
+    uint8_t redirect[MIN_HOOK_SIZE] __attribute__((aligned(32)));
+    int jump_len = hook_write_jump_at(redirect, (uint64_t)patch_addr, trampoline);
     if (jump_len < 0) {
         hook_log("[oat_patch] hook_write_jump failed: %d", jump_len);
         return -1;
@@ -535,21 +536,11 @@ static int apply_oat_inline_patch(
         hook_log("[oat_patch] applied via recomp at %#lx → %#lx",
                  (unsigned long)patch_addr, (unsigned long)recomp_addr);
     } else if (g_stealth_mode == 1) {
-        /* WxShadow 模式 */
+        /* WxShadow 模式 — stealth1 严格: wxshadow 失败拒绝降级 mprotect */
         if (wxshadow_patch((void*)patch_addr, redirect, overwrite) != 0) {
-            hook_log("\033[31m[STEALTH 失效] oat_patch wxshadow 失败 %#lx，fallback mprotect 直接修改原始内存！\033[0m",
+            hook_log("\033[31m[STEALTH] oat_patch wxshadow 失败 %#lx，拒绝降级 mprotect（hunter 防检测）\033[0m",
                      (unsigned long)patch_addr);
-            /* wxshadow 失败仍需 patch，否则会 SIGSEGV */
-            uintptr_t patch_end = patch_addr + overwrite;
-            uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);
-            size_t mprotect_size = page_end - page_start;
-            if (mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-                hook_log("[oat_patch] mprotect RWX failed at %#lx: %s",
-                         (unsigned long)page_start, strerror(errno));
-                return -1;
-            }
-            memcpy((void*)patch_addr, redirect, overwrite);
-            mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC);
+            return -1;
         }
         hook_flush_cache((void*)patch_addr, overwrite);
     } else {
@@ -716,17 +707,13 @@ int hook_restore_inlined_oat_header_patches(void) {
             }
         } else if (g_stealth_mode == 1) {
             if (wxshadow_release((void*)entry->original_addr) != 0) {
-                /* wxshadow release 失败，fallback mprotect */
-                uintptr_t patch_end = entry->original_addr + entry->patch_size;
-                uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);
-                size_t mprotect_size = page_end - page_start;
-                if (mprotect((void*)page_start, mprotect_size,
-                             PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-                    memcpy((void*)entry->original_addr, entry->original_bytes, entry->patch_size);
-                    mprotect((void*)page_start, mprotect_size, PROT_READ | PROT_EXEC);
-                }
+                /* stealth1: wxshadow release 失败不降级 mprotect。
+                 * shadow 页随进程退出由内核自动释放，不影响稳定性。 */
+                hook_log("[oat_patch] wxshadow_release failed for %#lx, shadow will be released on exit",
+                         (unsigned long)entry->original_addr);
+            } else {
+                hook_flush_cache((void*)entry->original_addr, entry->patch_size);
             }
-            hook_flush_cache((void*)entry->original_addr, entry->patch_size);
         } else {
             uintptr_t patch_end = entry->original_addr + entry->patch_size;
             uintptr_t page_end = (patch_end + page_size - 1) & ~(page_size - 1);

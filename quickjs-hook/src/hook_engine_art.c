@@ -477,8 +477,9 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
 
     pthread_mutex_lock(&g_engine.lock);
 
+    /* stub 通过 ArtMethod.entry_point_ 指针间接调用，不需要 near */
     size_t stub_alloc = 1024;
-    void* stub_mem = hook_alloc_near(stub_alloc, (void*)(uintptr_t)fallback_target);
+    void* stub_mem = hook_alloc(stub_alloc);
     if (!stub_mem) {
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
