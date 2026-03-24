@@ -128,9 +128,11 @@ jsrepl
 
 | API | 参数类型 | 返回类型 |
 | --- | --- | --- |
-| `hook(target, callback, stealth?)` | `AddressLike, (ctx: NativeHookContext) => any, boolean?` | `boolean` |
+| `hook(target, callback, stealth?)` | `AddressLike, (ctx: NativeHookContext) => any, number \| boolean?` | `boolean` |
 | `unhook(target)` | `AddressLike` | `boolean` |
+| `recompHook(target, callback)` | `AddressLike, (ctx: NativeHookContext) => any` | `boolean` |
 | `callNative(func, ...args)` | `AddressLike, up to 6 x (number \| bigint \| NativePointer)` | `number \| bigint` |
+| `diagAllocNear(addr)` | `AddressLike` | `undefined` |
 
 #### qbdi
 
@@ -469,23 +471,35 @@ console.log(JSON.stringify(info))
 ### 7.1 安装和移除 hook
 
 - `hook(target, callback[, stealth])`
+- `recompHook(target, callback)` — 等价于 `hook(target, callback, Hook.RECOMP)`
 - `unhook(target)`
+- `diagAllocNear(addr)` — 诊断 hook 内存 pool 分配状态
 
 参数说明：
 
 - `target` 必须是地址，可传 `NativePointer`、数字、`BigInt` 或十六进制字符串
 - `callback` 必须是 JS 函数
-- `stealth` 是可选布尔值，`true` 时优先使用 stealth 模式安装 inline hook
+- `stealth` 三种模式：
+  - `Hook.NORMAL` (0, 默认) — mprotect 直接写，ADRP/MOVZ 跳转 (12~20B)
+  - `Hook.WXSHADOW` (1) 或 `true` — 内核 shadow 页写入，不修改原始内存，优先 ADRP 12B patch
+  - `Hook.RECOMP` (2) — 内核页重编译，原始页不动，B 指令覆盖仅 4B
 
 示例：
 
 ```javascript
 var openPtr = Module.findExportByName("libc.so", "open")
 
+// stealth=0 (默认)
 hook(openPtr, function(ctx) {
   console.log("open called, x0 =", ptr(ctx.x0).toString())
   ctx.orig()
 })
+
+// stealth=1 (wxshadow)
+hook(openPtr, function(ctx) { ctx.orig() }, Hook.WXSHADOW)
+
+// stealth=2 (recomp)
+recompHook(openPtr, function(ctx) { ctx.orig() })
 ```
 
 ### 7.2 native hook 回调上下文
