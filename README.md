@@ -6,8 +6,28 @@ ARM64 Android 动态插桩框架。
 
 - Android NDK 25+（默认路径 `~/Android/Sdk/ndk/`）
 - Rust toolchain + `aarch64-linux-android` target
-- Python 3（构建 loader shellcode）
-- `.cargo/config.toml` 已配置交叉编译（仓库自带）
+- Python 3（构建 loader shellcode + 配置脚本）
+
+## 首次配置
+
+运行 `configure.py` 自动检测 NDK 并生成 `.cargo/config.toml`：
+
+```bash
+# 自动检测 NDK（默认搜索 ~/Android/Sdk/ndk/）
+python3 configure.py
+
+# 或指定 NDK 路径
+python3 configure.py --ndk /path/to/ndk
+
+# 或通过环境变量
+export ANDROID_NDK_HOME=/path/to/ndk
+python3 configure.py
+```
+
+确保已安装 Rust aarch64-linux-android target：
+```bash
+rustup target add aarch64-linux-android
+```
 
 ## 构建
 
