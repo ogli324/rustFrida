@@ -24,6 +24,10 @@ NDK_BASE = os.path.expanduser("~/Android/Sdk/ndk")
 
 def find_ndk():
     """Find the latest Android NDK."""
+    # 优先使用 ANDROID_NDK_HOME 环境变量（CI 场景）
+    ndk_home = os.environ.get("ANDROID_NDK_HOME", "")
+    if ndk_home and os.path.isdir(ndk_home):
+        return ndk_home
     if not os.path.isdir(NDK_BASE):
         print(f"错误: NDK 目录不存在: {NDK_BASE}")
         sys.exit(1)
