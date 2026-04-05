@@ -16,13 +16,13 @@ if [ -n "$ANDROID_NDK_HOME" ] && [ -d "$ANDROID_NDK_HOME" ]; then
 fi
 
 # 回退：在 ~/Android/Sdk/ndk/ 中搜索（使用 -L 跟随符号链接）
+NDK_BASE="$HOME/Android/Sdk/ndk"
+
 if [ -z "$NDK_CC" ]; then
-    NDK_BASE="$HOME/Android/Sdk/ndk"
     NDK_CC=$(find -L "$NDK_BASE" -name "aarch64-linux-android33-clang" 2>/dev/null | sort -V | tail -1)
 fi
 
 if [ -z "$NDK_CC" ]; then
-    NDK_BASE="$HOME/Android/Sdk/ndk"
     # 尝试其他 API level
     NDK_CC=$(find -L "$NDK_BASE" -name "aarch64-linux-android*-clang" 2>/dev/null | grep -v '++' | sort -V | tail -1)
 fi
