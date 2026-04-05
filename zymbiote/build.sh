@@ -6,6 +6,7 @@ cd "$SCRIPT_DIR"
 
 # 查找 NDK clang（优先环境变量，其次默认 SDK 目录）
 NDK_CC=""
+NDK_BASE="$HOME/Android/Sdk/ndk"
 if [ -n "$ANDROID_NDK_HOME" ] && [ -d "$ANDROID_NDK_HOME" ]; then
     NDK_CC=$(find -L "$ANDROID_NDK_HOME" -name "aarch64-linux-android33-clang" 2>/dev/null | sort -V | tail -1)
     if [ -z "$NDK_CC" ]; then
@@ -14,7 +15,6 @@ if [ -n "$ANDROID_NDK_HOME" ] && [ -d "$ANDROID_NDK_HOME" ]; then
 fi
 
 if [ -z "$NDK_CC" ]; then
-    NDK_BASE="$HOME/Android/Sdk/ndk"
     NDK_CC=$(find -L "$NDK_BASE" -name "aarch64-linux-android33-clang" 2>/dev/null | sort -V | tail -1)
 fi
 
