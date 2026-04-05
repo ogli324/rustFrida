@@ -1,0 +1,122 @@
+name: Build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  NDK_VERSION: "25.2.9519653"
+  ANDROID_API: "33"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 llvm libclang-dev
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25c
+          add-to-path: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: aarch64-linux-android
+          components: rust-src
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker
+
+      - name: Configure cargo for cross-compilation
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          CLANG="$TOOLCHAIN/bin/aarch64-linux-android${ANDROID_API}-clang"
+          AR="$TOOLCHAIN/bin/llvm-ar"
+          SYSROOT="$TOOLCHAIN/sysroot"
+
+          # Find clang_rt builtins path
+          CLANG_RT_DIR=$(find "$TOOLCHAIN/lib64/clang" -type d -name "baremetal" 2>/dev/null | head -1)
+          if [ -z "$CLANG_RT_DIR" ]; then
+            CLANG_RT_DIR=$(find "$TOOLCHAIN/lib/clang" -type d -name "baremetal" 2>/dev/null | head -1)
+          fi
+
+          cat > .cargo/config.toml << EOF
+          [build]
+          target = "aarch64-linux-android"
+
+          [target.aarch64-linux-android]
+          linker = "${CLANG}"
+          ar = "${AR}"
+          rustflags = ["-l", "clang_rt.builtins-aarch64", "-L", "${CLANG_RT_DIR}"]
+
+          [env]
+          CC_aarch64-linux-android = "${CLANG}"
+          BINDGEN_EXTRA_CLANG_ARGS = "--sysroot=${SYSROOT}"
+          EOF
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' .cargo/config.toml
+
+          echo "Cargo config:"
+          cat .cargo/config.toml
+
+      - name: Build loader shellcode
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          # Override NDK_BASE in build_helpers.py by symlinking
+          mkdir -p ~/Android/Sdk/ndk
+          NDK_DIR=$(basename "$ANDROID_NDK_HOME")
+          ln -sf "$ANDROID_NDK_HOME" ~/Android/Sdk/ndk/"$NDK_DIR"
+          python3 loader/build_helpers.py
+
+      - name: Build zymbiote
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          # Ensure NDK clang is discoverable
+          mkdir -p ~/Android/Sdk/ndk
+          NDK_DIR=$(basename "$ANDROID_NDK_HOME")
+          ln -sf "$ANDROID_NDK_HOME" ~/Android/Sdk/ndk/"$NDK_DIR"
+          bash zymbiote/build.sh
+
+      - name: Build agent
+        run: cargo build -p agent --release
+
+      - name: Build rustfrida
+        run: cargo build -p rust_frida --release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfrida-aarch64-android
+          path: |
+            target/aarch64-linux-android/release/rustfrida
+            target/aarch64-linux-android/release/libagent.so
+          if-no-files-found: error
