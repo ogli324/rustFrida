@@ -14,7 +14,13 @@ fn find_latest_ndk(ndk_base: &str) -> Option<String> {
         .filter(|e| e.path().is_dir())
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
-    versions.sort();
+    // Sort by numeric version components (e.g. "25.0.8775105" > "9.0.0")
+    versions.sort_by(|a, b| {
+        let parse = |s: &str| -> Vec<u64> {
+            s.split('.').filter_map(|p| p.parse::<u64>().ok()).collect()
+        };
+        parse(a).cmp(&parse(b))
+    });
     versions.last().map(|v| format!("{}/{}", ndk_base, v))
 }
 

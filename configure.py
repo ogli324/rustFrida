@@ -26,6 +26,17 @@ CARGO_CONFIG = os.path.join(SCRIPT_DIR, ".cargo", "config.toml")
 API_LEVEL = 33
 
 
+def _version_key(name):
+    """Parse a version directory name like '25.0.8775105' into a comparable tuple."""
+    parts = []
+    for p in name.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    return parts
+
+
 def find_ndk(explicit_path=None):
     """Find the Android NDK, checking multiple locations."""
     # 1. Explicit argument
@@ -44,7 +55,7 @@ def find_ndk(explicit_path=None):
     # 3. Default SDK location
     ndk_base = os.path.expanduser("~/Android/Sdk/ndk")
     if os.path.isdir(ndk_base):
-        versions = sorted(os.listdir(ndk_base), reverse=True)
+        versions = sorted(os.listdir(ndk_base), key=_version_key, reverse=True)
         for v in versions:
             candidate = os.path.join(ndk_base, v)
             if os.path.isdir(candidate):
@@ -60,7 +71,9 @@ def detect_host_tag():
     if system == "linux":
         return "linux-x86_64"
     elif system == "darwin":
-        # NDK uses x86_64 even on Apple Silicon (Rosetta 2)
+        # NDK r23+ ships native arm64 builds; prefer them on Apple Silicon
+        if machine == "arm64":
+            return "darwin-arm64"
         return "darwin-x86_64"
     elif system == "windows":
         return "windows-x86_64"
