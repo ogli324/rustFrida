@@ -100,10 +100,6 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          # Ensure NDK clang is discoverable
-          mkdir -p ~/Android/Sdk/ndk
-          NDK_DIR=$(basename "$ANDROID_NDK_HOME")
-          ln -sf "$ANDROID_NDK_HOME" ~/Android/Sdk/ndk/"$NDK_DIR"
           bash zymbiote/build.sh
 
       - name: Build agent
